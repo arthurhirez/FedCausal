@@ -1,0 +1,196 @@
+# =========================================================================
+# fedwater data catalog. Naming: gt_* entries are ground truth — they exist
+# to evaluate methods, never to train them.
+# =========================================================================
+
+graeme_network:
+  type: fedwater.datasets.WntrNetworkDataset
+  filepath: data/01_raw/Graeme.inp
+
+districts:
+  type: kedro_datasets.yaml.YAMLDataset
+  filepath: data/01_raw/districts_graeme.yml
+
+# --- network_prep ---------------------------------------------------------
+wn_variant:
+  type: pickle.PickleDataset
+  filepath: data/02_intermediate/wn_variant.pkl
+
+partition_report:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/partition_report.csv
+
+gt_boundaries:
+  type: pandas.CSVDataset
+  filepath: data/03_primary/gt_boundaries.csv
+  load_args:
+    dtype: {pipe: str}
+
+# --- urban_scenario -------------------------------------------------------
+income_factors:
+  type: pandas.CSVDataset
+  filepath: data/03_primary/income_factors.csv
+
+portfolios_t0:
+  type: pandas.ParquetDataset
+  filepath: data/02_intermediate/portfolios_t0.parquet
+
+gt_drift_schedule:
+  type: pandas.CSVDataset
+  filepath: data/03_primary/gt_drift_schedule.csv
+  load_args:
+    dtype: {node: str}
+
+assignments_timeline:
+  type: pandas.ParquetDataset
+  filepath: data/03_primary/assignments_timeline.parquet
+
+# --- demand_synthesis / hydraulics ----------------------------------------
+demand_series:
+  type: pandas.ParquetDataset
+  filepath: data/02_intermediate/demand_series.parquet
+
+pressures:
+  type: pandas.ParquetDataset
+  filepath: data/02_intermediate/pressures.parquet
+
+flows:
+  type: pandas.ParquetDataset
+  filepath: data/02_intermediate/flows.parquet
+
+demands_simulated:
+  type: pandas.ParquetDataset
+  filepath: data/02_intermediate/demands_simulated.parquet
+
+# --- sensing: what federated clients observe ------------------------------
+sensor_series:
+  type: pandas.ParquetDataset
+  filepath: data/03_primary/sensor_series.parquet
+
+client_datasets:
+  type: partitions.PartitionedDataset
+  path: data/07_model_output/clients
+  dataset:
+    type: pandas.CSVDataset
+    save_args: {index: false}
+  filename_suffix: ".csv"
+
+# --- validation & dependence ground truth ---------------------------------
+validation_report:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/validation_report.csv
+
+gt_topology:
+  type: pandas.CSVDataset
+  filepath: data/03_primary/gt_topology.csv
+
+feature_trajectories:
+  type: pandas.ParquetDataset
+  filepath: data/03_primary/feature_trajectories.parquet
+
+gt_dependence_battery:
+  type: pandas.CSVDataset
+  filepath: data/03_primary/gt_dependence_battery.csv
+
+gt_structure_recovery:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/gt_structure_recovery.csv
+
+# --- federated learning ----------------------------------------------------
+fl_windows:
+  type: pickle.PickleDataset
+  filepath: data/04_feature/fl_windows.pkl
+
+fl_scalers:
+  type: pandas.CSVDataset
+  filepath: data/04_feature/fl_scalers.csv
+
+fl_prep_report:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/fl_prep_report.csv
+
+fl_models:
+  type: pickle.PickleDataset
+  filepath: data/06_models/fl_models.pkl
+
+prototype_history:
+  type: pandas.ParquetDataset
+  filepath: data/07_model_output/prototype_history.parquet
+
+global_prototype_history:
+  type: pandas.ParquetDataset
+  filepath: data/07_model_output/global_prototype_history.parquet
+
+latent_trajectories:
+  type: pandas.ParquetDataset
+  filepath: data/07_model_output/latent_trajectories.parquet
+
+fl_training_log:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/fl_training_log.csv
+
+drift_signals:
+  type: pandas.CSVDataset
+  filepath: data/07_model_output/drift_signals.csv
+
+drift_report:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/drift_report.csv
+
+latent_trajectories_residualized:
+  type: pandas.ParquetDataset
+  filepath: data/07_model_output/latent_trajectories_residualized.parquet
+
+client_dependence:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/client_dependence.csv
+
+dependence_evaluation:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/dependence_evaluation.csv
+
+corrected_drift_signals:
+  type: pandas.CSVDataset
+  filepath: data/07_model_output/corrected_drift_signals.csv
+
+drift_attribution:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/drift_attribution.csv
+
+corrector_ladder_report:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/corrector_ladder_report.csv
+
+loop_diagnostics:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/loop_diagnostics.csv
+
+world_specs:
+  type: pandas.CSVDataset
+  filepath: data/05_model_input/world_specs.csv
+  load_args:
+    dtype: {drift_seed_node: str}
+
+labeled_pairs:
+  type: pandas.ParquetDataset
+  filepath: data/05_model_input/labeled_pairs.parquet
+
+labeled_clients:
+  type: pandas.ParquetDataset
+  filepath: data/05_model_input/labeled_clients.parquet
+
+automl_models:
+  type: pickle.PickleDataset
+  filepath: data/06_models/automl_models.pkl
+
+automl_report:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/automl_report.csv
+
+cluster_assignments:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/cluster_assignments.csv
+
+similarity_matrix:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/similarity_matrix.csv

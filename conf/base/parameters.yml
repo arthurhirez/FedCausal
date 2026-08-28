@@ -1,0 +1,197 @@
+# =========================================================================
+# fedwater simulation parameters — every physical assumption lives here.
+# =========================================================================
+seed: 42
+start_date: "2024-01-01"
+
+time:
+  n_months: 24          # simulation horizon, in model months
+  days_per_month: 30    # model months are fixed 30-day blocks (not calendar)
+  resolution_h: 1       # sensor/pattern resolution in hours
+
+hydraulics:
+  anchor_scale: 0.05    # node demand anchor = inp base demand x this scale.
+                        # Calibrated on PEAK-HOUR feasibility over the whole
+                        # scenario envelope (seasonal peak + fully drifted HL
+                        # district): 0.05 -> junction pressures 13-48 mca,
+                        # 100% inside the ABNT NBR 12218 band, diurnal swing
+                        # 13-31 mca. 0.06 already goes negative at worst case.
+  demand_multiplier: 1.0  # pins EPANET's global multiplier (inp had 0.2!)
+  demand_model: DD        # demand-driven; PDD available for stress studies
+
+coupling:               # the dependence dial
+  variant: baseline     # baseline | partial | isolated
+  close_fraction: 0.5   # used by 'partial' only
+
+scenario:
+  n_months: 24
+  # income/density per district, in district order A..E (BEPE 'LL_ML_HL_LL_LL'
+  # style, spelled out for auditability):
+  income_density_mapping:
+    - [low, low]        # District_A
+    - [low, medium]     # District_B
+    - [low, high]       # District_C
+    - [low, low]        # District_D
+    - [low, low]        # District_E
+  drift:
+    tgt_district: District_D
+    seed_node: "2"
+    warmup_months: 2
+    growth_chance: 0.8          # per-month chance the drift front advances
+    max_neighbors_per_month: 2  # staggered, geographic diffusion (BEPE design)
+    to_income: high
+    to_density: low
+
+buildings:
+  # m3/month consumed by ONE unit of each construction standard (BEPE table).
+  # Sanity: Brazilian household averages sit around 10-20 m3/month.
+  unit_m3_month: {1: 5, 2: 10, 3: 15, 4: 25, 5: 40}
+  # Standards mix by income (BEPE) -> drives mean unit volume -> income factor.
+  standards_by_income:
+    low:    {1: 0.40, 2: 0.40, 3: 0.175, 4: 0.025}
+    medium: {1: 0.10, 2: 0.30, 3: 0.50, 4: 0.10}
+    high:   {3: 0.20, 4: 0.40, 5: 0.40}
+  # Share of a block's UNITS living in each template, by density (derived from
+  # BEPE's building-count profiles x mean units per building, fixed here as
+  # explicit unit shares so the composition is directly auditable):
+  unit_share_by_density:
+    low:    {houses: 0.55, buildings_P: 0.35, buildings_M: 0.10}
+    medium: {houses: 0.15, buildings_P: 0.40, buildings_M: 0.45}
+    high:   {houses: 0.02, buildings_P: 0.18, buildings_M: 0.45, buildings_G: 0.35}
+  units_per_building:   # only for building-count reporting / plausibility
+    houses: [3, 15]
+    buildings_P: [15, 45]
+    buildings_M: [50, 125]
+    buildings_G: [125, 300]
+
+patterns:
+  peak_width_h: 1.6           # intrinsic width w0 of a unit's use peak
+  amp_sigma: 0.25             # per-unit amplitude dispersion (shrinks /sqrt N)
+  month_sigma: 0.03           # lognormal month-level volume wobble
+  seasonal_amplitude: 0.12    # +/-12% annual cycle on monthly volume
+  seasonal_peak_month: 0      # month-of-year index of max demand (austral summer)
+  drift_ramp_days: 10         # gradual onset of a node's new regime
+  # Behavioural core: peak-time dispersion across units. Low-density suburbs
+  # are synchronised (sharp aggregate peaks); high-density blocks are
+  # staggered (flat aggregates). Crowd smoothing follows analytically.
+  peak_dispersion_h_by_density: {low: 0.7, medium: 1.5, high: 2.6}
+  # Common-mode day-to-day variability (weather-like; does NOT shrink with N).
+  # Echoes BEPE's variation_strength ordering: low > medium > high.
+  day_sigma_by_density: {low: 0.12, medium: 0.07, high: 0.03}
+  night_by_density: {low: 0.15, medium: 0.30, high: 0.40}
+  # (center hour, amplitude) of each daily peak, by density — BEPE's
+  # DISTRIBUTION_PATTERNS reinterpreted as unit-level behaviour.
+  peaks_by_density:
+    low:    {morning: [7.0, 3.5], afternoon: [14.0, 1.0], evening: [19.0, 3.5]}
+    medium: {morning: [7.0, 2.6], afternoon: [14.0, 1.6], evening: [19.0, 2.0]}
+    high:   {morning: [7.5, 1.4], afternoon: [14.0, 1.2], evening: [19.5, 1.8]}
+  weekend_morning_shift_h: 2.0   # people sleep in
+  weekend_morning_damp: 0.75
+
+sensors:                # 2 pressure nodes + 3 flow links per district (BEPE)
+  District_A: {pressure: ["64", "75"], flow: ["102", "100", "85"]}
+  District_B: {pressure: ["79", "86"], flow: ["157", "135", "165"]}
+  District_C: {pressure: ["74", "58"], flow: ["110", "119", "91"]}
+  District_D: {pressure: ["31", "26"], flow: ["38", "96", "69"]}
+  District_E: {pressure: ["41", "12"], flow: ["59", "11", "19"]}
+
+noise:                  # instrumentation layer (separate from behaviour)
+  pressure_sigma: 0.10          # mca
+  pressure_quantization: 0.01   # mca
+  flow_sigma: 0.25              # L/s
+  flow_quantization: 0.01       # L/s
+
+validation:
+  mass_balance_rtol: 1.0e-6
+  volume_rtol: 1.0e-3
+  hard_pressure_floor_mca: 5.0
+  pressure_band_mca: [10.0, 50.0]     # ABNT NBR 12218 residential band
+  pressure_band_min_share: 0.98
+  unit_m3_month_band: [4.0, 45.0]
+  peak_factor_band: [1.1, 3.5]
+  peak_factor_min_share: 0.95
+
+oracle:
+  max_lag_h: 6              # lag window for cross-correlation (hours)
+  tiers: [1, 2, 3, 4]       # 1 linear | 2 nonlinear | 3 directional | 4 representation
+  n_surrogates: 100         # circular-shift null draws (cheap methods)
+  n_surrogates_expensive: 50
+  subsample: 1500           # contiguous chunk for lag-structure methods
+  dcor_subsample: 1000      # stride subsample for O(n^2) distance correlation
+  granger_lags: 24          # one diurnal cycle of residual dynamics
+  ccm:                      # Convergent Cross Mapping (Sugihara 2012)
+    embed_dim: 3
+    tau: 2
+    lib_sizes: [200, 1200]  # convergence = skill gain small -> large library
+    n_neighbors: 4
+  minirocket:               # Tier 4: FL-deployable representation space
+    window_h: 24
+    stride_h: 6
+    n_kernels: 2500
+    pca_dims: 10
+
+fl:                         # ---- federated learning over the client CSVs ----
+  preprocessing:
+    interval_agg_h: 2       # mean-aggregate sensors to 2h steps (BEPE default)
+    window_size: 84         # 84 x 2h = 7 days per window (BEPE default)
+    step_size: 1            # window stride, in aggregated steps
+    reference_months: 2     # scaler commissioning period == simulator drift
+                            # warm-up: guaranteed pre-drift for every client.
+                            # Fitting on the FULL series (legacy) leaks the
+                            # future and compresses the drift signal.
+    label_threshold: 0.75   # majority share required to label a window
+    feature_range: [-1.0, 1.0]
+  model:
+    lstm_units: 30          # latent dim = 2 x units (bi-LSTM bottleneck)
+    reg_ratio: 0.5          # AER loss weighting (Wong et al. 2022)
+  training:
+    # seed:                 # optional: decouples FL training (model init,
+    #                       # shuffling, FINCH order) from the global sim
+    #                       # seed. Set by the experiments engine as the
+    #                       # replicate axis; when absent, training uses the
+    #                       # global `seed` (shipped behaviour).
+    rounds: 15              # communication rounds (BEPE default)
+    local_epochs: 1
+    learning_rate: 0.001
+    batch_size: 64
+    participation: 1.0      # fraction of clients online per round
+    averaging: equal        # equal | weight (by client window count)
+    proto_alpha: 0.2        # hierarchical loss: a*InfoNCE + (1-a)*MSE (FPL)
+    infonce_temperature: 0.02
+    device: cpu
+  dependence:              # federated dependence detection & quantification
+    max_lag_windows: 6      # PC1 lead-lag search range, in window units
+    n_surrogates: 200       # p floor 1/201: a lone dependent pair among the
+                            # 10 still clears BH-FDR at alpha=0.05
+    n_surrogates_expensive: 50
+  attribution:             # dependence-aware drift correction (C0..C3)
+    reference_months: 6     # scale/weights calibration window (see drift)
+    ridge_lambda: 1.0       # C3 peer-prediction regularization
+    mask_q_threshold: 0.05  # partial-RV edges kept in the C3 masked variant
+    loop_iterations: 6      # C4 alternating (g, gains, weights) passes
+  label_factory:           # simulation-supervised dataset generation
+    n_worlds: 2             # demo batch; scale freely (cache-or-run)
+    coupling_variants: [[baseline, 0.0], [partial, 0.3], [partial, 0.6], [isolated, 1.0]]
+    anchor_by_variant: {baseline: 0.05, partial: 0.04, isolated: 0.05}
+    drift_incomes: [medium, high]
+    n_months: 12
+    fl_rounds: 8
+    step_size: 3
+    oracle_tiers: [1, 4]
+    scratch_dir: /tmp/fedwater_worlds
+  automl:                   # learned detectors over the factory tables
+    max_leaf_nodes: [15, 31]   # small HistGB search grid (escalate later)
+    learning_rate: [0.05, 0.1]
+  personalization:         # drift + dependence -> personalized clusters
+    domain_weight: 0.5      # S = w*deconfounded-prototype + (1-w)*drift-shape
+    coupling_penalty: 0.5   # how strongly direct coupling discounts similarity
+    coupling_q_threshold: 0.05  # partial-RV edges that count as coupling
+  drift:
+    reference_months: 6     # threshold calibration window (needs >1 delta
+                            # point; distinct from the scaler commissioning
+                            # period). May overlap early drift months, which
+                            # only inflates the drifted client's own
+                            # threshold -> conservative onset estimates.
+    k_sigma: 3.0            # detection threshold: mu_ref + k*sigma_ref
+    persistence: 3          # consecutive months above threshold: drift is a
+                            # sustained regime change, not a 2-month excursion

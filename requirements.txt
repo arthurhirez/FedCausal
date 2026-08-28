@@ -1,0 +1,13 @@
+kedro~=1.5.0
+kedro-datasets[pandas-parquetdataset,pandas-csvdataset,yaml-yamldataset]>=9.0
+wntr>=1.5
+aeon>=1.0
+scikit-learn
+torch
+numpy
+pandas
+networkx
+scipy
+pyarrow
+pytest
+ruff

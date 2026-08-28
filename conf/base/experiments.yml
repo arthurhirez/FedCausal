@@ -1,0 +1,183 @@
+# Declarative experiment studies for the fedwater experiments engine.
+#
+#   python -m fedwater.experiments list
+#   python -m fedwater.experiments run <study> [--n-jobs N] [--dry-run]
+#
+# A study = worlds x runs. A *world* (sim_seed, coupling, consumption map,
+# drift block, anchor, horizon, oracle settings) is simulated once and
+# cached by content hash under <root>/worlds/. A *run* (fl_seed, stride,
+# batch, rounds, surrogates) reuses a cached world's simulation artifacts
+# via hardlinks — replication costs only FL training, never EPANET.
+#
+# Section grammar (worlds and runs alike):
+#   fixed: constants; grid: cartesian axes (lists or {range: N});
+#   zip: paired profiles crossed against the grid, never against each
+#   other. Or give an explicit list of spec dicts. Precedence on key
+#   collision: fixed < grid < zip.
+#
+# Consumption maps are 5-token strings, district order A..E, each token =
+# income initial + density initial over {L, M, H}. The shipped scenario is
+# LL_LM_LH_LL_LL. Drift validity rule: the target district must change at
+# least ONE of (income, density) versus its map state — either alone
+# suffices; changing neither is a no-op drift and is rejected at spec time.
+#
+# Failure policy (a): infeasible worlds (e.g. a demand-heavy map failing
+# the V-checks at the calibrated anchor) are RECORDED as
+# sim_validation_failed and the sweep continues — infeasibility is data.
+# Policy (b), the auto-anchor retry ladder, ships implemented but commented
+# in engine.ensure_world.
+
+root: data/09_experiments
+
+studies:
+
+  # ------------------------------------------------------------------ D0 --
+  # Seed-replication study: hold the world fixed, vary ONLY FL training.
+  # Decomposes every FL-side statistic into signal vs training noise, on
+  # both the coupled world (the claims) and the isolated world (the null
+  # control / calibration).
+  #
+  # Pre-registered trigger (agreed 2026-07-17): if the replicated 90%
+  # interval of the Level-T partial-RV structure AUROC spans 0.5 on the
+  # coupled baseline, the 1.00 point-estimate headline is retired in favor
+  # of the distributional/ensemble estimator.
+  #
+  # Both fl profiles are first-class: (step 2, batch 128) is the shipped
+  # throughput setting behind the documented numbers; (step 1, batch 64) is
+  # the BEPE-faithful default behind the local reproduction. World blocks
+  # are written out explicitly (they equal conf/base today) so the manifest
+  # papertrail is self-contained even if base parameters later change.
+  d0_replication:
+    description: >
+      2 worlds (baseline + isolated) x 2 fl profiles x 20 fl seeds = 80 FL
+      runs on 2 cached simulations. Full shipped horizon (24 months,
+      15 rounds) because that is where the audited claims live.
+    worlds:
+      fixed:
+        sim_seed: 42
+        n_months: 24
+        anchor_scale: 0.05
+        consumption_map: LL_LM_LH_LL_LL
+        drift: {tgt_district: District_D, seed_node: "2",
+                to_income: high, to_density: low}
+        # Oracle trimmed to the cheap + representation tiers: D0 audits the
+        # FL side; the full centralized battery is not the measurand here.
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+      grid:
+        coupling: [{variant: baseline, close_fraction: 0.0},
+                   {variant: isolated, close_fraction: 1.0}]
+    runs:
+      fixed: {rounds: 15}
+      grid:
+        fl_seed: {range: 20}
+      zip:
+        - {step_size: 2, batch_size: 128}   # shipped throughput profile
+        - {step_size: 1, batch_size: 64}    # BEPE-faithful default profile
+    pipelines: [fl, dependence_detection, drift_attribution]
+    harvest: [validation, drift, ladder, c4, dependence]
+    retain: [prototype_history, latent_trajectories,
+             latent_trajectories_residualized]
+
+  # -------------------------------------------------- drift-origin sweep --
+  # Which client drifts? One world per target district (seed node
+  # auto-picked: the district's largest-base-demand junction, skipping
+  # zero-demand trunk nodes), >= 3 fl seeds each — the D0 lesson applied:
+  # no per-world point estimates without a seed spread. Exploratory scale
+  # (12 months / 8 rounds / stride 3, the label-factory operating point).
+  drift_origin_sweep:
+    description: >
+      5 worlds (drift origin A..E, auto seed node) x 3 fl seeds at
+      exploratory scale.
+    worlds:
+      fixed:
+        sim_seed: 42
+        n_months: 12
+        anchor_scale: 0.05
+        consumption_map: LL_LM_LL_LL_LM
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+      grid:
+        drift: [{tgt_district: District_A, to_income: low, to_density: medium},
+                {tgt_district: District_B, to_income: low, to_density: low},
+                {tgt_district: District_C, to_income: low, to_density: medium},
+                {tgt_district: District_D, to_income: low, to_density: medium},
+                {tgt_district: District_E, to_income: low, to_density: low}]
+    runs:
+      fixed: {rounds: 8, step_size: 3, batch_size: 128,
+              n_surrogates: 40, n_surrogates_expensive: 15}
+      grid:
+        fl_seed: [0, 1, 2]
+    pipelines: [fl, dependence_detection, drift_attribution]
+    harvest: [validation, drift, ladder, c4, dependence]
+    retain: [prototype_history]
+
+  # ----------------------------------------------- consumption-map sweep --
+  # How does the income/density portfolio change the story? Map 1 is the
+  # shipped scenario; map 2 is the BEPE-style income gradient; map 3 is
+  # deliberately demand-heavy to exercise the feasibility policy — if it
+  # fails V-checks at anchor 0.05 that is a *recorded outcome* (policy a),
+  # or uncomment the auto-anchor ladder in engine.ensure_world (policy b).
+  consumption_map_sweep:
+    description: >
+      3 consumption maps x 3 fl seeds at exploratory scale; drift fixed on
+      District_D (low->high income in every map).
+    worlds:
+      fixed:
+        sim_seed: 42
+        n_months: 12
+        anchor_scale: 0.05
+        drift: {tgt_district: District_D, seed_node: "2",
+                to_income: high, to_density: low}
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+      grid:
+        consumption_map: [LL_LM_LH_LL_LL,      # shipped scenario
+                          LL_ML_HL_LL_LL,      # BEPE income gradient
+                          MH_HM_HL_LL_LM]      # demand-heavy stress case
+    runs:
+      fixed: {rounds: 8, step_size: 3, batch_size: 128,
+              n_surrogates: 40, n_surrogates_expensive: 15}
+      grid:
+        fl_seed: [0, 1, 2]
+    pipelines: [fl, dependence_detection, drift_attribution]
+    harvest: [validation, drift, ladder, c4, dependence]
+    retain: [prototype_history]
+
+
+  drift_origin_prospect:
+    description: >
+      5 worlds (drift origin A..E, auto seed node) — worlds only for now;
+      single fl_seed kept in the run spec for when you run it.
+    worlds:
+      fixed:
+        sim_seed: 42
+        n_months: 12
+        anchor_scale: 0.05
+        consumption_map: LM_LL_LL_LL_LM
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+      grid:
+        drift: [{tgt_district: District_A, to_income: low, to_density: low},
+                {tgt_district: District_B, to_income: low, to_density: medium},
+                {tgt_district: District_C, to_income: low, to_density: medium},
+                {tgt_district: District_D, to_income: low, to_density: medium},
+                {tgt_district: District_E, to_income: low, to_density: low}]
+    runs:
+      fixed: {rounds: 8, step_size: 3, batch_size: 128,
+              n_surrogates: 40, n_surrogates_expensive: 15, fl_seed: 0}
+    pipelines: [fl, dependence_detection, drift_attribution]
+    harvest: [validation, drift, ladder, c4, dependence]
+    retain: [prototype_history]
