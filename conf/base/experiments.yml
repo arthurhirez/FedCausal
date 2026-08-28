@@ -181,3 +181,32 @@ studies:
     pipelines: [fl, dependence_detection, drift_attribution]
     harvest: [validation, drift, ladder, c4, dependence]
     retain: [prototype_history]
+
+
+  drift_origin_prospect_30:
+    description: >
+      5 worlds (drift origin A..E, auto seed node) — worlds only for now;
+      single fl_seed kept in the run spec for when you run it.
+    worlds:
+      fixed:
+        sim_seed: 42
+        n_months: 30
+        anchor_scale: 0.05
+        consumption_map: LH_LL_LL_LL_LM
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+      grid:
+        drift: [{tgt_district: District_A, to_income: low, to_density: low, warmup_months: 4},
+                {tgt_district: District_B, to_income: low, to_density: high, warmup_months: 4},
+                {tgt_district: District_C, to_income: low, to_density: medium, warmup_months: 4},
+                {tgt_district: District_D, to_income: low, to_density: high, warmup_months: 4},
+                {tgt_district: District_E, to_income: low, to_density: low, warmup_months: 4}]
+    runs:
+      fixed: {rounds: 8, step_size: 3, batch_size: 128,
+              n_surrogates: 40, n_surrogates_expensive: 15, fl_seed: 0}
+    pipelines: [fl, dependence_detection, drift_attribution]
+    harvest: [validation, drift, ladder, c4, dependence]
+    retain: [prototype_history]
