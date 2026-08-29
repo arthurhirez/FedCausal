@@ -42,27 +42,52 @@ scenario:
     to_income: high
     to_density: low
 
+# buildings:
+#   # m3/month consumed by ONE unit of each construction standard (BEPE table).
+#   # Sanity: Brazilian household averages sit around 10-20 m3/month.
+#   unit_m3_month: {1: 5, 2: 10, 3: 15, 4: 25, 5: 40}
+#   # Standards mix by income (BEPE) -> drives mean unit volume -> income factor.
+#   standards_by_income:
+#     low:    {1: 0.40, 2: 0.40, 3: 0.175, 4: 0.025}
+#     medium: {1: 0.10, 2: 0.30, 3: 0.50, 4: 0.10}
+#     high:   {3: 0.20, 4: 0.40, 5: 0.40}
+#   # Share of a block's UNITS living in each template, by density (derived from
+#   # BEPE's building-count profiles x mean units per building, fixed here as
+#   # explicit unit shares so the composition is directly auditable):
+#   unit_share_by_density:
+#     low:    {houses: 0.55, buildings_P: 0.35, buildings_M: 0.10}
+#     medium: {houses: 0.15, buildings_P: 0.40, buildings_M: 0.45}
+#     high:   {houses: 0.02, buildings_P: 0.18, buildings_M: 0.45, buildings_G: 0.35}
+#   units_per_building:   # only for building-count reporting / plausibility
+#     houses: [3, 15]
+#     buildings_P: [15, 45]
+#     buildings_M: [50, 125]
+#     buildings_G: [125, 300]
+
+
 buildings:
   # m3/month consumed by ONE unit of each construction standard (BEPE table).
   # Sanity: Brazilian household averages sit around 10-20 m3/month.
-  unit_m3_month: {1: 5, 2: 10, 3: 15, 4: 25, 5: 40}
+  unit_m3_month: {1: 1, 2: 2, 3: 4, 4: 6, 5: 9}
   # Standards mix by income (BEPE) -> drives mean unit volume -> income factor.
   standards_by_income:
-    low:    {1: 0.40, 2: 0.40, 3: 0.175, 4: 0.025}
-    medium: {1: 0.10, 2: 0.30, 3: 0.50, 4: 0.10}
-    high:   {3: 0.20, 4: 0.40, 5: 0.40}
+    low:    {1: 0.75, 2: 0.15, 3: 0.10}
+    medium: {1: 0.25, 2: 0.25, 3: 0.50}
+    high:   {3: 0.15, 4: 0.40, 5: 0.45}
   # Share of a block's UNITS living in each template, by density (derived from
   # BEPE's building-count profiles x mean units per building, fixed here as
   # explicit unit shares so the composition is directly auditable):
   unit_share_by_density:
-    low:    {houses: 0.55, buildings_P: 0.35, buildings_M: 0.10}
-    medium: {houses: 0.15, buildings_P: 0.40, buildings_M: 0.45}
-    high:   {houses: 0.02, buildings_P: 0.18, buildings_M: 0.45, buildings_G: 0.35}
+    low:    {houses: 0.85, buildings_P: 0.15}
+    medium: {houses: 0.50, buildings_P: 0.40, buildings_M: 0.10}
+    high:   {houses: 0.20, buildings_P: 0.30, buildings_M: 0.40, buildings_G: 0.10}
   units_per_building:   # only for building-count reporting / plausibility
-    houses: [3, 15]
-    buildings_P: [15, 45]
-    buildings_M: [50, 125]
-    buildings_G: [125, 300]
+    houses: [1, 5]
+    buildings_P: [6, 15]
+    buildings_M: [17, 40]
+    buildings_G: [45, 75]
+
+
 
 patterns:
   peak_width_h: 1.6           # intrinsic width w0 of a unit's use peak
