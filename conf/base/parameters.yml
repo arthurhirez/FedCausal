@@ -1,23 +1,48 @@
 # =========================================================================
 # fedwater simulation parameters — every physical assumption lives here.
+#
+# LAND-USE REFACTOR: the `density` axis has been replaced by a three-sector
+# land-use model (residential / commercial / industrial). Rationale: density
+# was volume-neutral by construction (the month series is renormalised to the
+# node's target volume, and volume was a pure function of income), and its
+# hydraulic direction was backwards — higher density widened the peak-time
+# dispersion, flattening the aggregate and RAISING minimum pressure. Land use
+# drives both level (via a plot-intensity table, dialled by `scenario.beta`)
+# and shape (via per-sector daily and weekly signatures). Shape is the point:
+# per-client MinMax fitted on `fl.preprocessing.reference_months` destroys
+# level information, so a level-coded regime is discarded by the scaler,
+# while a weekday/weekend gate and a night-floor change survive it.
 # =========================================================================
 seed: 42
 start_date: "2024-01-01"
 
 time:
   n_months: 24          # simulation horizon, in model months
-  days_per_month: 30    # model months are fixed 30-day blocks (not calendar)
+  days_per_month: 30    # model months are fixed 30-day blocks (not calendar).
+                        # Weekends come from a GLOBAL day counter
+                        # ((month*days + d) % 7), so the weekly cycle is
+                        # continuous across months at any value. A month then
+                        # holds 8 or 9 weekend days depending on phase; volume
+                        # is renormalised exactly, so this redistributes the
+                        # monthly shape slightly rather than leaking volume.
   resolution_h: 1       # sensor/pattern resolution in hours
 
 hydraulics:
   anchor_scale: 0.05    # node demand anchor = inp base demand x this scale.
-                        # Calibrated on PEAK-HOUR feasibility over the whole
-                        # scenario envelope (seasonal peak + fully drifted HL
-                        # district): 0.05 -> junction pressures 13-48 mca,
-                        # 100% inside the ABNT NBR 12218 band, diurnal swing
-                        # 13-31 mca. 0.06 already goes negative at worst case.
+                        # Unchanged by the refactor: the capacity frontier sits
+                        # at ~1050-1200 L/s network peak (min pressure crosses
+                        # the 5 mca floor there), and undrifted land-use
+                        # baselines run ~280-800 L/s depending on the map.
+                        # Overpressure is NOT the binding constraint — max
+                        # pressure stayed ~48 mca in every stress case,
+                        # including commercial districts near zero at 3am.
+                        # Re-confirm jointly with `scenario.beta` over
+                        # anchors (0.03, 0.04, 0.05) before quoting either.
   demand_multiplier: 1.0  # pins EPANET's global multiplier (inp had 0.2!)
-  demand_model: DD        # demand-driven; PDD available for stress studies
+  demand_model: DD        # demand-driven; PDD available for stress studies.
+                          # Under DD an over-capacity regime reports negative
+                          # pressures rather than unmet demand — that is the
+                          # model reporting overload, not a solver failure.
 
 coupling:               # the dependence dial
   variant: baseline     # baseline | partial | isolated
@@ -25,93 +50,176 @@ coupling:               # the dependence dial
 
 scenario:
   n_months: 24
-  # income/density per district, in district order A..E (BEPE 'LL_ML_HL_LL_LL'
-  # style, spelled out for auditability):
-  income_density_mapping:
-    - [low, low]        # District_A
-    - [low, medium]     # District_B
-    - [low, high]       # District_C
-    - [low, low]        # District_D
-    - [low, low]        # District_E
+  # The level dial. level_factor = (mean_plot_intensity / reference) ** beta.
+  #   beta = 0.0  -> shape-only: volume-neutral, reproduces the pre-refactor
+  #                  hydraulic loading exactly.
+  #   beta = 1.0  -> full level effect.
+  # The level effect is what threatens feasibility and is NOT what carries the
+  # regime information: at beta=0 a District_D residential->commercial drift
+  # still moved the MinMax-scaled weekly profile by shape_shift 0.88
+  # (residential->industrial 0.61). A low beta buys most of the legibility at
+  # almost none of the hydraulic risk — hence the default below.
+  # Use 0.25 if several districts drift together. Grid it in experiments.yml.
+  beta: 0.35
+  # income/land-use per district, in district order A..E. Compact code is
+  # income initial {L,M,H} + land-use initial {R,M,C,I}; 'M' is disambiguated
+  # by position (medium income vs mixed land use). Spelled out here for
+  # auditability; the engine's `consumption_map` encodes the same thing.
+  income_landuse_mapping:
+    - [low, residential]  # District_A
+    - [low, mixed]        # District_B
+    - [low, commercial]   # District_C
+    - [low, residential]  # District_D
+    - [low, residential]  # District_E
   drift:
     tgt_district: District_D
     seed_node: "2"
-    warmup_months: 2
+    warmup_months: 2            # MUST be >= 1: apply_drift_ramp blends against
+                                # the month BEFORE the switch, so a node
+                                # drifting at month 0 has nothing to blend from.
     growth_chance: 0.8          # per-month chance the drift front advances
-    max_neighbors_per_month: 2  # staggered, geographic diffusion (BEPE design)
-    to_income: high
-    to_density: low
+    max_neighbors_per_month: 2  # limits the WIDTH of the front, not its depth:
+                                # the front advances one BFS ring per month, so
+                                # a short horizon leaves the district only
+                                # partially converted.
+    to_income: low
+    to_land_use: commercial
 
-# buildings:
-#   # m3/month consumed by ONE unit of each construction standard (BEPE table).
-#   # Sanity: Brazilian household averages sit around 10-20 m3/month.
-#   unit_m3_month: {1: 5, 2: 10, 3: 15, 4: 25, 5: 40}
-#   # Standards mix by income (BEPE) -> drives mean unit volume -> income factor.
-#   standards_by_income:
-#     low:    {1: 0.40, 2: 0.40, 3: 0.175, 4: 0.025}
-#     medium: {1: 0.10, 2: 0.30, 3: 0.50, 4: 0.10}
-#     high:   {3: 0.20, 4: 0.40, 5: 0.40}
-#   # Share of a block's UNITS living in each template, by density (derived from
-#   # BEPE's building-count profiles x mean units per building, fixed here as
-#   # explicit unit shares so the composition is directly auditable):
-#   unit_share_by_density:
-#     low:    {houses: 0.55, buildings_P: 0.35, buildings_M: 0.10}
-#     medium: {houses: 0.15, buildings_P: 0.40, buildings_M: 0.45}
-#     high:   {houses: 0.02, buildings_P: 0.18, buildings_M: 0.45, buildings_G: 0.35}
-#   units_per_building:   # only for building-count reporting / plausibility
-#     houses: [3, 15]
-#     buildings_P: [15, 45]
-#     buildings_M: [50, 125]
-#     buildings_G: [125, 300]
+# --------------------------------------------------------------- land use --
+land_use:
+  # Per-sector daily and weekly signatures. `kind: peaks` sums Gaussian use
+  # peaks over a night floor; `kind: plateau` is a boxcar over a night floor.
+  # A plateau is convolved with the SAME Gaussian start-time jitter the
+  # residential peaks use (a difference of two erfs), so crowd smoothing stays
+  # DERIVED from 1/sqrt(N) rather than tuned. Establishments are few per block,
+  # so commercial and industrial cohorts come out naturally noisier with no
+  # extra parameter.
+  sectors:
+    residential:
+      kind: peaks
+      night: 0.15             # night floor, relative to peak amplitude
+      dispersion_h: 0.9       # start-time jitter across plots
+      weekend_factor: 1.00    # whole-day multiplier on Sat/Sun
+      day_sigma: 0.12         # common-mode day-to-day (weather) variability
+      seasonal_amplitude: 0.14
+      peaks:                  # {name: [center hour, amplitude]}
+        morning:   [7.0, 3.5]
+        afternoon: [14.0, 1.0]
+        evening:   [19.0, 3.5]
+    commercial:
+      kind: plateau
+      window: [8.0, 18.0]     # work-hours plateau. NOTE: the boxcar assumes
+                              # a < b, so windows may not wrap past midnight.
+      night: 0.03             # near-zero out of hours -> pushes minimum night
+                              # flow toward zero (the DMA diagnostic)
+      amp: 1.00
+      dispersion_h: 0.8
+      weekend_factor: 0.15    # near-closed Sat/Sun
+      day_sigma: 0.05         # weakly weather-sensitive
+      seasonal_amplitude: 0.06
+    industrial:
+      kind: plateau
+      window: [6.0, 22.0]
+      night: 0.85             # 24/7 draw -> RAISES minimum night flow, the
+                              # opposite sign to commercial
+      amp: 0.22               # mild day lift over a high base
+      dispersion_h: 0.5
+      weekend_factor: 0.90    # mild weekly dip
+      day_sigma: 0.02         # process water: weather-insensitive
+      seasonal_amplitude: 0.01
 
+  # m3/month per plot for the non-residential sectors, as a multiple of ONE
+  # medium-income residential unit. Residential intensity is NOT free — it is
+  # `mean_unit_m3_month(income)` from `buildings.standards_by_income` below, so
+  # income stays a residential-only attribute by construction and only these
+  # two numbers are new assumptions.
+  # Tuning history: an earlier set (3.0 / 9.0, with industrial contamination in
+  # the `mixed` and `commercial` mixes) put median beta_max_pass at 0.5 and
+  # failed on single-district drifts. These values raise it to 1.0 for
+  # single-district drifts. KEEP THEM unless re-running the ablation.
+  intensity_rel: {commercial: 2.5, industrial: 8}
+
+  # Plot shares per land-use class. Plot COUNT is conserved across a land-use
+  # change, so the level factor is the ratio of mean plot intensities.
+  mix:
+    residential: {residential: 1.00}
+    mixed:       {residential: 0.70, commercial: 0.30}
+    commercial:  {residential: 0.35, commercial: 0.65}
+    industrial:  {residential: 0.20, commercial: 0.30, industrial: 0.50}
+
+  reference: [low, residential]  # (income, land_use) whose level_factor == 1
+  min_plots: 0.5                 # cohorts below half a plot are DROPPED and the
+                                 # remainder renormalised, so node volume is
+                                 # preserved exactly instead of leaking with the
+                                 # dropped cohort.
 
 buildings:
   # m3/month consumed by ONE unit of each construction standard (BEPE table).
   # Sanity: Brazilian household averages sit around 10-20 m3/month.
-  unit_m3_month: {1: 1, 2: 2, 3: 4, 4: 6, 5: 9}
+  # STILL USED: feeds `build_income_factors`, whose `mean_unit_m3_month` is the
+  # residential plot intensity in the land-use model above.
+  unit_m3_month: {1: 5, 2: 10, 3: 15, 4: 25, 5: 40}
   # Standards mix by income (BEPE) -> drives mean unit volume -> income factor.
   standards_by_income:
-    low:    {1: 0.75, 2: 0.15, 3: 0.10}
-    medium: {1: 0.25, 2: 0.25, 3: 0.50}
-    high:   {3: 0.15, 4: 0.40, 5: 0.45}
-  # Share of a block's UNITS living in each template, by density (derived from
-  # BEPE's building-count profiles x mean units per building, fixed here as
-  # explicit unit shares so the composition is directly auditable):
-  unit_share_by_density:
-    low:    {houses: 0.85, buildings_P: 0.15}
-    medium: {houses: 0.50, buildings_P: 0.40, buildings_M: 0.10}
-    high:   {houses: 0.20, buildings_P: 0.30, buildings_M: 0.40, buildings_G: 0.10}
-  units_per_building:   # only for building-count reporting / plausibility
-    houses: [1, 5]
-    buildings_P: [6, 15]
-    buildings_M: [17, 40]
-    buildings_G: [45, 75]
+    low:    {1: 0.40, 2: 0.40, 3: 0.175, 4: 0.025}
+    medium: {1: 0.10, 2: 0.30, 3: 0.50, 4: 0.10}
+    high:   {3: 0.20, 4: 0.40, 5: 0.40}
 
-
+  # ---- V0, NOT USED after the land-use refactor ----------------------------
+  # Both keys belonged to the density axis: `unit_share_by_density` split a
+  # node's units into building templates and `units_per_building` turned unit
+  # counts into building counts for the `n_buildings` reporting column. Land-use
+  # cohorts are sector plots, not building templates, so nothing reads either
+  # one. Kept commented as the V0 record and as the starting point for the
+  # DEFERRED houses-vs-apartments sub-axis inside the residential sector.
+  #
+  # unit_share_by_density:
+  #   low:    {houses: 0.55, buildings_P: 0.35, buildings_M: 0.10}
+  #   medium: {houses: 0.15, buildings_P: 0.40, buildings_M: 0.45}
+  #   high:   {houses: 0.02, buildings_P: 0.18, buildings_M: 0.45, buildings_G: 0.35}
+  # units_per_building:
+  #   houses: [3, 15]
+  #   buildings_P: [15, 45]
+  #   buildings_M: [50, 125]
+  #   buildings_G: [125, 300]
 
 patterns:
-  peak_width_h: 1.6           # intrinsic width w0 of a unit's use peak
-  amp_sigma: 0.25             # per-unit amplitude dispersion (shrinks /sqrt N)
+  peak_width_h: 1.6           # intrinsic width w0 of a plot's use peak/edge
+  amp_sigma: 0.25             # per-plot amplitude dispersion (shrinks /sqrt N)
   month_sigma: 0.03           # lognormal month-level volume wobble
-  seasonal_amplitude: 0.12    # +/-12% annual cycle on monthly volume
+  seasonality_scale: 1.0      # global multiplier on the per-sector seasonal
+                              # amplitudes; set to 0.0 to disable seasonality
+                              # for level comparisons (before/after months sit
+                              # at different seasonal phases, a ~17% swing that
+                              # otherwise confounds them).
   seasonal_peak_month: 0      # month-of-year index of max demand (austral summer)
-  drift_ramp_days: 10         # gradual onset of a node's new regime
-  # Behavioural core: peak-time dispersion across units. Low-density suburbs
-  # are synchronised (sharp aggregate peaks); high-density blocks are
-  # staggered (flat aggregates). Crowd smoothing follows analytically.
-  peak_dispersion_h_by_density: {low: 0.7, medium: 1.5, high: 2.6}
-  # Common-mode day-to-day variability (weather-like; does NOT shrink with N).
-  # Echoes BEPE's variation_strength ordering: low > medium > high.
-  day_sigma_by_density: {low: 0.12, medium: 0.07, high: 0.03}
-  night_by_density: {low: 0.15, medium: 0.30, high: 0.40}
-  # (center hour, amplitude) of each daily peak, by density — BEPE's
-  # DISTRIBUTION_PATTERNS reinterpreted as unit-level behaviour.
-  peaks_by_density:
-    low:    {morning: [7.0, 3.5], afternoon: [14.0, 1.0], evening: [19.0, 3.5]}
-    medium: {morning: [7.0, 2.6], afternoon: [14.0, 1.6], evening: [19.0, 2.0]}
-    high:   {morning: [7.5, 1.4], afternoon: [14.0, 1.2], evening: [19.5, 1.8]}
-  weekend_morning_shift_h: 2.0   # people sleep in
+  drift_ramp_days: 42         # construction-scale ramp for a land-use change.
+                              # MUST be clamped against the remaining horizon:
+                              # min(drift_ramp_days,
+                              #     (n_months - last_switch_month) * days_per_month - 1).
+                              # growth_chance and max_neighbors_per_month decide
+                              # how late the front finishes, so any horizon
+                              # change can silently re-break this.
+  weekend_morning_shift_h: 2.0   # people sleep in (residential only)
   weekend_morning_damp: 0.75
+
+  # ---- V0, NOT USED after the land-use refactor ----------------------------
+  # All five keys were keyed by `density` and are superseded by
+  # `land_use.sectors`: the residential peaks moved verbatim into
+  # `sectors.residential.peaks`, and night / dispersion / day_sigma /
+  # seasonal_amplitude became per-sector fields. `seasonal_amplitude` is now
+  # volume-weighted across a node's sectors (industrial process water is
+  # weather-insensitive; residential is not), so a single global value no
+  # longer applies.
+  #
+  # seasonal_amplitude: 0.12
+  # peak_dispersion_h_by_density: {low: 0.7, medium: 1.5, high: 2.6}
+  # day_sigma_by_density: {low: 0.12, medium: 0.07, high: 0.03}
+  # night_by_density: {low: 0.15, medium: 0.30, high: 0.40}
+  # peaks_by_density:
+  #   low:    {morning: [7.0, 3.5], afternoon: [14.0, 1.0], evening: [19.0, 3.5]}
+  #   medium: {morning: [7.0, 2.6], afternoon: [14.0, 1.6], evening: [19.0, 2.0]}
+  #   high:   {morning: [7.5, 1.4], afternoon: [14.0, 1.2], evening: [19.5, 1.8]}
 
 sensors:                # 2 pressure nodes + 3 flow links per district (BEPE)
   District_A: {pressure: ["64", "75"], flow: ["102", "100", "85"]}
@@ -132,9 +240,35 @@ validation:
   hard_pressure_floor_mca: 5.0
   pressure_band_mca: [10.0, 50.0]     # ABNT NBR 12218 residential band
   pressure_band_min_share: 0.98
-  unit_m3_month_band: [4.0, 45.0]
-  peak_factor_band: [1.1, 3.5]
+  unit_m3_month_band: [4.0, 45.0]     # V5: applies to RESIDENTIAL plots only.
+                                      # Note this is now a cheap table
+                                      # assertion, not a diagnostic: cohort
+                                      # plots are back-solved as
+                                      # sector_volume / intensity, so the
+                                      # implied per-plot volume is identically
+                                      # the standards-table value.
+  peak_factor_band: [1.1, 3.5]        # V6 band. The ORDERING assertion that
+                                      # replaces the old density ordering is
+                                      # still TBD — land-use classes are sector
+                                      # MIXES (e.g. `commercial` is 35% resi by
+                                      # plot share, and cohorts mix by VOLUME),
+                                      # so the node-level ordering must be
+                                      # measured on a real run before it is
+                                      # written down.
   peak_factor_min_share: 0.95
+  calibration_band: [0.5, 2.0]        # DIAGNOSTIC ONLY — recorded, never raised.
+                                      # Calibration renormalises month-0 total
+                                      # volume to the anchor total, so it is
+                                      # hydraulically a no-op; a value of 0.4
+                                      # just means the map's raw factors ran hot
+                                      # before renormalisation. Gating on it
+                                      # short-circuits the feasibility search
+                                      # before it reaches the real boundary.
+  peak_factor_order: Null             # land-use codes in expected DECREASING
+                                      # peak-factor order. Leave unset until
+                                      # measured on a real run — V6 then
+                                      # reports the class means without
+                                      # asserting an ordering.
 
 oracle:
   max_lag_h: 6              # lag window for cross-correlation (hours)
@@ -157,8 +291,11 @@ oracle:
 
 fl:                         # ---- federated learning over the client CSVs ----
   preprocessing:
-    interval_agg_h: 2       # mean-aggregate sensors to 2h steps (BEPE default)
-    window_size: 84         # 84 x 2h = 7 days per window (BEPE default)
+    interval_agg_h: 2       # mean-aggregate sensors to 2h steps (BEPE default).
+                            # steps_per_month = 30*24 = 720, divisible by 2, so
+                            # no aggregation block straddles a month boundary.
+    window_size: 84         # 84 x 2h = exactly 7 days per window, so a weekly
+                            # land-use gate is fully resolved inside one window.
     step_size: 1            # window stride, in aggregated steps
     reference_months: 2     # scaler commissioning period == simulator drift
                             # warm-up: guaranteed pre-drift for every client.
@@ -198,7 +335,9 @@ fl:                         # ---- federated learning over the client CSVs ----
     n_worlds: 2             # demo batch; scale freely (cache-or-run)
     coupling_variants: [[baseline, 0.0], [partial, 0.3], [partial, 0.6], [isolated, 1.0]]
     anchor_by_variant: {baseline: 0.05, partial: 0.04, isolated: 0.05}
-    drift_incomes: [medium, high]
+    drift_incomes: [low]            # income is residential-only now; the
+                                    # informative axis is the land use below
+    drift_land_uses: [mixed, commercial, industrial]
     n_months: 12
     fl_rounds: 8
     step_size: 3
@@ -214,9 +353,6 @@ fl:                         # ---- federated learning over the client CSVs ----
   drift:
     reference_months: 6     # threshold calibration window (needs >1 delta
                             # point; distinct from the scaler commissioning
-                            # period). May overlap early drift months, which
-                            # only inflates the drifted client's own
-                            # threshold -> conservative onset estimates.
-    k_sigma: 3.0            # detection threshold: mu_ref + k*sigma_ref
-    persistence: 3          # consecutive months above threshold: drift is a
-                            # sustained regime change, not a 2-month excursion
+                            # period).
+    k_sigma: 3.0
+    persistence: 2

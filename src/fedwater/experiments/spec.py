@@ -3,8 +3,9 @@
 The experiments engine factors every study into two nested identities:
 
 * **World** — everything that determines the simulated physics: sim seed,
-  coupling variant/fraction, anchor scale, horizon, consumption map, drift
-  block, oracle settings. Expensive; simulated once; cached by content hash.
+  coupling variant/fraction, anchor scale, horizon, consumption map, level
+  dial (``beta``), drift block, oracle settings. Expensive; simulated once;
+  cached by content hash.
 * **Run** — everything that determines learning + analysis on a fixed
   world: FL seed, window stride, batch size, rounds, surrogate counts.
   Cheap; many runs reuse one cached world (this is what makes seed
@@ -17,9 +18,16 @@ top-level-replaced by the world override, exactly as Kedro merges
 The run hash covers the full effective ``fl`` block plus the pipeline list.
 
 Consumption maps are written as compact 5-token strings in district order
-A..E, each token = income initial + density initial over {L, M, H}; e.g.
-the shipped scenario is ``LL_LM_LH_LL_LL`` (all incomes low; densities
-low/medium/high/low/low).
+A..E, each token = income initial + LAND-USE initial. The two alphabets are
+distinct — income over {L, M, H}, land use over {R, M, C, I} — and ``M`` is
+disambiguated by position (medium income vs mixed land use). The shipped
+scenario is ``LR_LM_LC_LR_LR``: all incomes low, land use
+residential / mixed / commercial / residential / residential.
+
+LAND-USE REFACTOR: this module previously encoded a density axis, with both
+token positions drawn from {L, M, H}. Every consumption map and every drift
+target changed, so every world hash changed — ``data/09_experiments/worlds/``
+must be re-simulated in full.
 """
 from __future__ import annotations
 
@@ -32,8 +40,14 @@ from pathlib import Path
 
 import yaml
 
-_CODE = {"L": "low", "M": "medium", "H": "high"}
-_CODE_INV = {v: k for k, v in _CODE.items()}
+# Income initials and land-use initials are SEPARATE alphabets. 'M' means
+# medium income in position 0 and mixed land use in position 1 — position
+# disambiguates, so the two tables must never be merged back into one.
+_INCOME = {"L": "low", "M": "medium", "H": "high"}
+_LAND_USE = {"R": "residential", "M": "mixed", "C": "commercial",
+             "I": "industrial"}
+_INCOME_INV = {v: k for k, v in _INCOME.items()}
+_LAND_USE_INV = {v: k for k, v in _LAND_USE.items()}
 COUPLING_VARIANTS = ("baseline", "partial", "isolated")
 
 # Run-spec keys promoted to first-class axes -> their path inside the fl block.
@@ -56,7 +70,7 @@ DEFAULT_PIPELINES = ("fl", "dependence_detection", "drift_attribution")
 # consumption-map codec
 # --------------------------------------------------------------------------
 def decode_map(code: str, n_districts: int = 5) -> list[list[str]]:
-    """``'LL_LM_LH_LL_LL' -> [['low','low'], ['low','medium'], ...]``."""
+    """``'LR_LM_LC_LR_LR' -> [['low','residential'], ['low','mixed'], ...]``."""
     tokens = code.strip().upper().split("_")
     if len(tokens) != n_districts:
         raise ValueError(
@@ -65,18 +79,19 @@ def decode_map(code: str, n_districts: int = 5) -> list[list[str]]:
         )
     out = []
     for t in tokens:
-        if len(t) != 2 or t[0] not in _CODE or t[1] not in _CODE:
+        if len(t) != 2 or t[0] not in _INCOME or t[1] not in _LAND_USE:
             raise ValueError(
-                f"consumption_map token '{t}' invalid: expected two of "
-                f"{sorted(_CODE)} (income initial + density initial)."
+                f"consumption_map token '{t}' invalid: expected an income "
+                f"initial from {sorted(_INCOME)} followed by a land-use "
+                f"initial from {sorted(_LAND_USE)}."
             )
-        out.append([_CODE[t[0]], _CODE[t[1]]])
+        out.append([_INCOME[t[0]], _LAND_USE[t[1]]])
     return out
 
 
 def encode_map(mapping: list) -> str:
     """Inverse of :func:`decode_map` (accepts lists or tuples)."""
-    return "_".join(_CODE_INV[i] + _CODE_INV[d] for i, d in mapping)
+    return "_".join(_INCOME_INV[i] + _LAND_USE_INV[lu] for i, lu in mapping)
 
 
 # --------------------------------------------------------------------------
@@ -160,13 +175,22 @@ def resolve_world(world: dict, base_params: dict) -> dict:
     """Build the FULL top-level parameter blocks a world writes to
     ``conf/local`` (Kedro merges destructively at the top level — partial
     blocks silently erase sibling keys, the documented gotcha), plus the
-    effective sim configuration and its content hash."""
+    effective sim configuration and its content hash.
+
+    Note on ``land_use``: the sector table, intensities and mixes live in a
+    base-only block and are NOT part of the override, exactly like
+    ``buildings`` and ``patterns``. They still reach the hash through
+    ``effective``, so editing them invalidates caches correctly; a study that
+    wants to sweep them goes through ``sim_overrides``.
+    """
     base = base_params
     scenario = copy.deepcopy(base["scenario"])
     n_months = int(world.get("n_months", base["time"]["n_months"]))
     scenario["n_months"] = n_months
     if "consumption_map" in world:
-        scenario["income_density_mapping"] = decode_map(world["consumption_map"])
+        scenario["income_landuse_mapping"] = decode_map(world["consumption_map"])
+    if "beta" in world:
+        scenario["beta"] = float(world["beta"])
     drift_patch = world.get("drift", {}) or {}
     scenario["drift"] = _deep_merge(scenario["drift"], drift_patch)
     if ("tgt_district" in drift_patch and "seed_node" not in drift_patch
@@ -204,11 +228,12 @@ def resolve_world(world: dict, base_params: dict) -> dict:
         "variant": override["coupling"]["variant"],
         "close_fraction": float(override["coupling"].get("close_fraction", 0.0)),
         "anchor_scale": override["hydraulics"]["anchor_scale"],
-        "consumption_map": encode_map(scenario["income_density_mapping"]),
+        "beta": float(scenario["beta"]),
+        "consumption_map": encode_map(scenario["income_landuse_mapping"]),
         "drift_district": scenario["drift"]["tgt_district"],
         "drift_seed_node": scenario["drift"].get("seed_node"),
         "drift_to_income": scenario["drift"]["to_income"],
-        "drift_to_density": scenario["drift"]["to_density"],
+        "drift_to_land_use": scenario["drift"]["to_land_use"],
     }
     return {"sim_hash": canonical_hash(effective), "override": override,
             "effective": effective, "flat": flat}
@@ -244,10 +269,10 @@ def resolve_run(run: dict, base_params: dict,
 def validate_world(resolved: dict, districts: dict) -> None:
     """Raise ``ValueError`` on specs that cannot produce a meaningful world.
 
-    Drift rule (per design review): the drift target must change **at least
-    one** of (income, density) relative to the district's initial state on
-    the consumption map — either alone is enough, both is fine, neither is
-    a no-op drift and is rejected.
+    Drift rule (per design review, carried over from the density axis): the
+    drift target must change **at least one** of (income, land_use) relative
+    to the district's initial state on the consumption map — either alone is
+    enough, both is fine, neither is a no-op drift and is rejected.
     """
     eff, flat = resolved["effective"], resolved["flat"]
     names = list(districts["districts"])
@@ -256,6 +281,9 @@ def validate_world(resolved: dict, districts: dict) -> None:
                          f"{COUPLING_VARIANTS}.")
     if not 0.0 <= flat["close_fraction"] <= 1.0:
         raise ValueError(f"close_fraction {flat['close_fraction']} outside [0, 1].")
+    if flat["beta"] < 0.0:
+        raise ValueError(f"scenario.beta {flat['beta']} must be >= 0 "
+                         "(0 = shape-only, 1 = full level effect).")
     tgt = flat["drift_district"]
     if tgt not in names:
         raise ValueError(f"drift.tgt_district '{tgt}' not one of {names}.")
@@ -264,17 +292,27 @@ def validate_world(resolved: dict, districts: dict) -> None:
             str(n) for n in districts["districts"][tgt]]:
         raise ValueError(f"drift.seed_node '{seed_node}' is not a node of {tgt}.")
 
-    mapping = eff["scenario"]["income_density_mapping"]
-    init_income, init_density = mapping[names.index(tgt)]
-    if (flat["drift_to_income"] == init_income
-            and flat["drift_to_density"] == init_density):
+    land_use_codes = set(eff["land_use"]["mix"])
+    if flat["drift_to_land_use"] not in land_use_codes:
         raise ValueError(
-            f"Drift on {tgt} is a no-op: to_income/to_density "
-            f"({flat['drift_to_income']}, {flat['drift_to_density']}) equal the "
-            f"initial map state ({init_income}, {init_density}). At least one "
-            f"of income or density must change.")
+            f"drift.to_land_use '{flat['drift_to_land_use']}' is not a class "
+            f"in land_use.mix ({sorted(land_use_codes)}).")
+
+    mapping = eff["scenario"]["income_landuse_mapping"]
+    init_income, init_land_use = mapping[names.index(tgt)]
+    if (flat["drift_to_income"] == init_income
+            and flat["drift_to_land_use"] == init_land_use):
+        raise ValueError(
+            f"Drift on {tgt} is a no-op: to_income/to_land_use "
+            f"({flat['drift_to_income']}, {flat['drift_to_land_use']}) equal "
+            f"the initial map state ({init_income}, {init_land_use}). At least "
+            f"one of income or land use must change.")
 
     warmup = int(eff["scenario"]["drift"].get("warmup_months", 0))
+    if warmup < 1:
+        # apply_drift_ramp blends the new regime against the month BEFORE the
+        # switch, so a node drifting at month 0 has nothing to blend from.
+        raise ValueError(f"drift.warmup_months must be >= 1 (got {warmup}).")
     if flat["n_months"] < warmup + 2:
         raise ValueError(
             f"n_months={flat['n_months']} leaves no room for drift "
@@ -289,6 +327,25 @@ def with_anchor(resolved: dict, anchor_scale: float) -> dict:
     out["override"]["hydraulics"]["anchor_scale"] = float(anchor_scale)
     out["effective"]["hydraulics"]["anchor_scale"] = float(anchor_scale)
     out["flat"]["anchor_scale"] = float(anchor_scale)
+    out["sim_hash"] = canonical_hash(out["effective"])
+    return out
+
+
+def with_beta(resolved: dict, beta: float) -> dict:
+    """A copy of a resolved world at a different level dial ``beta`` (and the
+    correspondingly different content hash).
+
+    The land-use analogue of :func:`with_anchor`, and the cheaper of the two
+    feasibility levers: ``beta`` moves only the demand LEVEL implied by the
+    land-use map, leaving the temporal signatures — the part that survives the
+    FL scaler — untouched. Lowering it therefore buys hydraulic headroom at
+    little cost in regime legibility, whereas lowering ``anchor_scale`` moves
+    the whole network's operating point and is a cross-world confound.
+    """
+    out = copy.deepcopy(resolved)
+    out["override"]["scenario"]["beta"] = float(beta)
+    out["effective"]["scenario"]["beta"] = float(beta)
+    out["flat"]["beta"] = float(beta)
     out["sim_hash"] = canonical_hash(out["effective"])
     return out
 

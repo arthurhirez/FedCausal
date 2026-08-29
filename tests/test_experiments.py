@@ -29,17 +29,13 @@ INP = ROOT / "data/01_raw/Graeme.inp"
 
 
 # ---------------------------------------------------------------- spec ----
-def test_map_codec_roundtrip_and_matches_base_scenario():
-    assert spec_mod.encode_map(BASE["scenario"]["income_density_mapping"]) \
-        == "LL_LM_LH_LL_LL"
-    assert spec_mod.decode_map("LL_LM_LH_LL_LL") \
-        == BASE["scenario"]["income_density_mapping"]
-    code = "MH_HM_HL_LL_LM"
-    assert spec_mod.encode_map(spec_mod.decode_map(code)) == code
-    with pytest.raises(ValueError):
-        spec_mod.decode_map("LL_LM_LH_LL")        # wrong length
-    with pytest.raises(ValueError):
-        spec_mod.decode_map("LL_LM_LH_LL_XX")     # unknown token
+def test_map_codec_matches_base_scenario():
+    """The compact code and the spelled-out base mapping must agree — this is
+    what stops conf/base and experiments.yml drifting apart silently."""
+    assert spec_mod.encode_map(BASE["scenario"]["income_landuse_mapping"]) \
+        == "LR_LM_LC_LR_LR"
+    assert spec_mod.decode_map("LR_LM_LC_LR_LR") \
+        == BASE["scenario"]["income_landuse_mapping"]
 
 
 def test_canonical_hash_is_order_and_numeric_type_stable():
@@ -65,14 +61,18 @@ def test_expand_axes_fixed_grid_zip_and_range():
 
 def test_resolve_world_hash_moves_with_the_physics_only():
     w0 = spec_mod.resolve_world({}, BASE)              # pure base
-    assert w0["flat"]["consumption_map"] == "LL_LM_LH_LL_LL"
+    assert w0["flat"]["consumption_map"] == "LR_LM_LC_LR_LR"
     assert w0["flat"]["drift_district"] == "District_D"
-    w_map = spec_mod.resolve_world({"consumption_map": "LL_ML_HL_LL_LL"}, BASE)
+    assert w0["flat"]["drift_to_land_use"] == "commercial"
+    w_map = spec_mod.resolve_world({"consumption_map": "LR_MR_HR_LR_LR"}, BASE)
     w_seed = spec_mod.resolve_world({"sim_seed": 7}, BASE)
+    w_beta = spec_mod.resolve_world({"beta": 0.0}, BASE)
     w_anchor = spec_mod.with_anchor(w0, 0.04)
-    hashes = {w["sim_hash"] for w in (w0, w_map, w_seed, w_anchor)}
-    assert len(hashes) == 4
+    hashes = {w["sim_hash"] for w in (w0, w_map, w_seed, w_beta, w_anchor)}
+    assert len(hashes) == 5
     assert spec_mod.resolve_world({}, BASE)["sim_hash"] == w0["sim_hash"]
+    # beta is a world axis, and with_beta must agree with the spec route
+    assert spec_mod.with_beta(w0, 0.0)["sim_hash"] == w_beta["sim_hash"]
     # full-block override discipline (the Kedro destructive-merge gotcha):
     assert set(w_map["override"]["scenario"]) == set(BASE["scenario"])
     assert set(w_map["override"]["hydraulics"]) == set(BASE["hydraulics"])
@@ -97,24 +97,43 @@ def test_resolve_run_promotes_keys_and_hashes_fl_identity():
         spec_mod.resolve_run({"stride": 2}, BASE)       # unknown key
 
 
-def test_validator_income_or_density_rule():
-    """Drift must change at least ONE of (income, density) vs the map's
+def test_validator_income_or_land_use_rule():
+    """Drift must change at least ONE of (income, land_use) vs the map's
     initial state for the target district — either alone suffices."""
     def world(**drift):
-        return spec_mod.resolve_world(
-            {"drift": {"tgt_district": "District_D", "seed_node": "2",
-                       **drift}}, BASE)
-    # District_D starts (low, low) on the shipped map.
-    with pytest.raises(ValueError, match="no-op"):
-        spec_mod.validate_world(world(to_income="low", to_density="low"),
-                                DISTRICTS)
-    spec_mod.validate_world(world(to_income="high", to_density="low"),
-                            DISTRICTS)                  # income alone: ok
-    spec_mod.validate_world(world(to_income="low", to_density="medium"),
-                            DISTRICTS)                  # density alone: ok
-    spec_mod.validate_world(world(to_income="high", to_density="high"),
-                            DISTRICTS)                  # both: ok
+        return spec_mod.resolve_world({"drift": {**drift}}, BASE)
 
+    # District_D starts (low, residential) on LR_LM_LC_LR_LR
+    with pytest.raises(ValueError, match="no-op"):
+        spec_mod.validate_world(
+            world(to_income="low", to_land_use="residential"), DISTRICTS)
+    spec_mod.validate_world(
+        world(to_income="high", to_land_use="residential"), DISTRICTS)  # income alone
+    spec_mod.validate_world(
+        world(to_income="low", to_land_use="commercial"), DISTRICTS)    # land use alone
+    spec_mod.validate_world(
+        world(to_income="high", to_land_use="industrial"), DISTRICTS)   # both
+    with pytest.raises(ValueError, match="land_use.mix"):
+        spec_mod.validate_world(
+            world(to_income="low", to_land_use="agricultural"), DISTRICTS)
+
+
+def test_map_codec_roundtrips_and_rejects_bad_tokens():
+    """The two token positions draw on DIFFERENT alphabets; 'M' is medium
+    income in position 0 and mixed land use in position 1."""
+    code = "LR_MM_HC_LI_LM"
+    decoded = spec_mod.decode_map(code)
+    assert decoded[1] == ["medium", "mixed"]
+    assert spec_mod.encode_map(decoded) == code
+    for bad in ("LR_LM_LC_LR", "LX_LM_LC_LR_LR", "LL_LM_LC_LR_LR", "L_LM_LC_LR_LR"):
+        with pytest.raises(ValueError):
+            spec_mod.decode_map(bad)
+
+
+def test_validator_rejects_zero_warmup():
+    with pytest.raises(ValueError, match="warmup_months"):
+        spec_mod.validate_world(spec_mod.resolve_world(
+            {"drift": {"warmup_months": 0}}, BASE), DISTRICTS)
 
 def test_validator_rejects_bad_targets_and_horizons():
     bad_node = spec_mod.resolve_world(
@@ -151,6 +170,9 @@ def test_expand_study_resolves_the_declared_studies():
         d, n = w["flat"]["drift_district"], w["flat"]["drift_seed_node"]
         assert n in [str(x) for x in DISTRICTS["districts"][d]]
 
+    betas = spec_mod.expand_study("beta_sweep", Path.cwd())
+    assert len(betas["worlds"]) == 5 and len(betas["runs"]) == 3
+    assert {w["flat"]["beta"] for w in betas["worlds"]} == {0.0, 0.25, 0.5, 0.75, 1.0}
 
 def test_effective_fl_seed_fallback_and_zero():
     assert effective_fl_seed({"training": {}}, 42) == 42
@@ -188,7 +210,7 @@ def _fake_run_data(tmp_path: Path) -> Path:
                  ).to_csv(data / "08_reporting/loop_diagnostics.csv", index=False)
     pd.DataFrame({"node": ["2"], "district": ["District_D"],
                   "drift_month": [2], "to_income": ["high"],
-                  "to_density": ["low"]}).to_csv(
+                  "to_land_use": ["commercial"]}).to_csv(
         data / "03_primary/gt_drift_schedule.csv", index=False)
     pd.DataFrame({"kind": ["flow"], "tier": [1], "method": ["corr"],
                   "district_a": ["District_A"], "district_b": ["District_B"],
@@ -368,6 +390,9 @@ def test_label_factory_assembles_from_engine_harvests(tmp_path, monkeypatch):
     monkeypatch.setattr(ExperimentEngine, "ensure_run", fake_run)
     fl = yaml.safe_load(Path("conf/base/parameters.yml").read_text())["fl"]
     fl["label_factory"]["scratch_dir"] = str(tmp_path / "scratch")
+    # No district on the base map is industrial, so no draw can produce a
+    # no-op drift — generate_labeled_worlds now validates before simulating.
+    fl["label_factory"]["drift_land_uses"] = ["industrial"]
     specs = factory.build_world_specs(
         fl, DISTRICTS, seed=42).head(2)
     pairs, clients = factory.generate_labeled_worlds(specs, fl)
@@ -389,7 +414,7 @@ def test_micro_world_through_real_pipelines(tmp_path):
     world = spec_mod.resolve_world(
         {"sim_seed": 11, "n_months": 4,
          "drift": {"tgt_district": "District_D", "seed_node": "2",
-                   "to_income": "high"},
+                   "to_income": "low", "to_land_use": "commercial"},
          "oracle": {"tiers": [1], "n_surrogates": 5,
                     "n_surrogates_expensive": 3}}, BASE)
     spec_mod.validate_world(world, DISTRICTS)

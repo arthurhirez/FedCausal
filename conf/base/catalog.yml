@@ -31,10 +31,14 @@ income_factors:
   type: pandas.CSVDataset
   filepath: data/03_primary/income_factors.csv
 
+landuse_factors:
+  type: pandas.CSVDataset
+  filepath: data/03_primary/landuse_factors.csv
+
 portfolios_t0:
   type: pandas.ParquetDataset
   filepath: data/02_intermediate/portfolios_t0.parquet
-
+  
 gt_drift_schedule:
   type: pandas.CSVDataset
   filepath: data/03_primary/gt_drift_schedule.csv

@@ -8,8 +8,8 @@ def create_pipeline(**kwargs) -> Pipeline:
         [
             node(
                 synthesize_demands,
-                inputs=["assignments_timeline", "params:patterns", "params:time",
-                        "params:seed"],
+                inputs=["assignments_timeline", "params:land_use",
+                        "params:patterns", "params:time", "params:seed"],
                 outputs="demand_series_raw",
                 name="synthesize_demands",
             ),

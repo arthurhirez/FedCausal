@@ -2,8 +2,8 @@
 
 Each *world* is a full pipeline run (simulation -> FL -> dependence ->
 attribution) under a randomized spec: seed, coupling variant/fraction, drift
-origin district, drift seed node, drift target income. From every world we
-extract:
+origin district, drift seed node, and the drift's target income and LAND USE.
+From every world we extract:
 
 * ``labeled_pairs``   — one row per district pair: dependence statistics
   from the oracle battery and the federated Level-T methods (features),
@@ -32,7 +32,13 @@ unchanged, so AutoML consumers are unaffected.
 Divergence from the engine's default failure policy, on purpose: a sweep
 records failures and continues (infeasibility is data), but the factory
 RAISES on any failed world — a supervised table silently missing worlds is
-worse than no table.
+worse than no table. The same discipline is why specs are validated here
+before anything is simulated (see ``generate_labeled_worlds``).
+
+LAND-USE REFACTOR: drift targets now draw a land use as well as an income,
+from ``fl.label_factory.drift_land_uses``. The extra draw shifts the RNG
+stream, so world specs at a given seed differ from the pre-refactor ones —
+which is moot, since every world hash changed anyway.
 """
 from __future__ import annotations
 
@@ -43,7 +49,7 @@ import pandas as pd
 import yaml
 
 from fedwater.experiments.engine import ExperimentEngine
-from fedwater.experiments.spec import resolve_run, resolve_world
+from fedwater.experiments.spec import resolve_run, resolve_world, validate_world
 
 DISTRICTS = [f"District_{x}" for x in "ABCDE"]
 
@@ -55,7 +61,16 @@ _FACTORY_RUN_SURROGATES = {"n_surrogates": 40, "n_surrogates_expensive": 15}
 
 
 def build_world_specs(fl: dict, districts: dict, seed: int) -> pd.DataFrame:
-    """Deterministic randomized specs. One row per world."""
+    """Deterministic randomized specs. One row per world.
+
+    Income and land use are drawn INDEPENDENTLY of the district's initial
+    state on the base consumption map, so a draw can land on a no-op drift
+    (target equals the district's current income AND land use). That is
+    caught by ``validate_world`` in :func:`generate_labeled_worlds` rather
+    than resampled here, because silently resampling would make the spec
+    table a function of the base map — and the table is meant to be a
+    self-contained, reproducible record of what was asked for.
+    """
     cfg = fl["label_factory"]
     rng = np.random.default_rng(seed)
     variants = cfg["coupling_variants"]  # e.g. [[baseline,0],[partial,.3],...]
@@ -69,6 +84,7 @@ def build_world_specs(fl: dict, districts: dict, seed: int) -> pd.DataFrame:
             variant=variant, close_fraction=float(frac),
             drift_district=tgt, drift_seed_node=seed_node,
             drift_to_income=str(rng.choice(cfg["drift_incomes"])),
+            drift_to_land_use=str(rng.choice(cfg["drift_land_uses"])),
             anchor_scale=cfg["anchor_by_variant"].get(variant, 0.05),
         ))
     return pd.DataFrame(rows)
@@ -76,7 +92,13 @@ def build_world_specs(fl: dict, districts: dict, seed: int) -> pd.DataFrame:
 
 def _world_raw(spec, cfg) -> dict:
     """Engine world spec for one factory row (same reductions the factory
-    always applied: short horizon, cheap oracle tiers, small MiniRocket)."""
+    always applied: short horizon, cheap oracle tiers, small MiniRocket).
+
+    ``beta`` is deliberately not set here, so factory worlds inherit
+    ``scenario.beta`` from base parameters. Vary it by editing base or by
+    promoting it to a factory axis — but note that it is a WORLD axis, so
+    every value is a separate simulation.
+    """
     return {
         "sim_seed": int(spec.world_seed),
         "n_months": int(cfg["n_months"]),
@@ -85,7 +107,8 @@ def _world_raw(spec, cfg) -> dict:
                      "close_fraction": float(spec.close_fraction)},
         "drift": {"tgt_district": spec.drift_district,
                   "seed_node": str(spec.drift_seed_node),
-                  "to_income": spec.drift_to_income},
+                  "to_income": spec.drift_to_income,
+                  "to_land_use": spec.drift_to_land_use},
         "oracle": {"tiers": cfg["oracle_tiers"], **_FACTORY_ORACLE_EXTRAS},
     }
 
@@ -97,6 +120,8 @@ def generate_labeled_worlds(world_specs: pd.DataFrame, fl: dict):
     project = Path.cwd()
     base_params = yaml.safe_load(
         (project / "conf/base/parameters.yml").read_text())
+    districts = yaml.safe_load(
+        (project / "data/01_raw/districts_graeme.yml").read_text())
     engine = ExperimentEngine(project, root=Path(cfg["scratch_dir"]))
     run = resolve_run({"step_size": cfg["step_size"], "batch_size": 128,
                        "rounds": cfg["fl_rounds"],
@@ -106,6 +131,17 @@ def generate_labeled_worlds(world_specs: pd.DataFrame, fl: dict):
     pairs, clients = [], []
     for spec in world_specs.itertuples(index=False):
         world = resolve_world(_world_raw(spec, cfg), base_params)
+        # Validate BEFORE simulating: a no-op drift (target income and land
+        # use both equal to the district's initial state) would otherwise
+        # simulate a world with nothing to detect and then fail the
+        # exactly-one-origin assertion at the very end, after the expensive
+        # part. Fail here, with a message that names the offending world.
+        try:
+            validate_world(world, districts)
+        except ValueError as exc:
+            raise ValueError(
+                f"world {spec.world} has an invalid spec: {exc}") from exc
+
         built = engine.ensure_world(world)
         if built["status"] != "ok":
             raise RuntimeError(

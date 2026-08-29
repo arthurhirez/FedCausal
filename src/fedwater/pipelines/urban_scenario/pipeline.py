@@ -3,6 +3,7 @@ from kedro.pipeline import Pipeline, node
 from .nodes import (
     build_drift_schedule,
     build_income_factors,
+    build_landuse_factors,
     build_portfolios,
     evolve_assignments,
 )
@@ -18,10 +19,16 @@ def create_pipeline(**kwargs) -> Pipeline:
                 name="build_income_factors",
             ),
             node(
+                build_landuse_factors,
+                inputs=["income_factors", "params:land_use", "params:scenario"],
+                outputs="landuse_factors",
+                name="build_landuse_factors",
+            ),
+            node(
                 build_portfolios,
-                inputs=["wn_variant", "districts", "income_factors",
-                        "params:scenario", "params:buildings",
-                        "params:hydraulics", "params:seed"],
+                inputs=["wn_variant", "districts", "landuse_factors",
+                        "income_factors", "params:scenario", "params:land_use",
+                        "params:hydraulics"],
                 outputs="portfolios_t0",
                 name="build_portfolios",
             ),
@@ -33,8 +40,8 @@ def create_pipeline(**kwargs) -> Pipeline:
             ),
             node(
                 evolve_assignments,
-                inputs=["portfolios_t0", "gt_drift_schedule", "income_factors",
-                        "params:buildings", "params:scenario", "params:seed"],
+                inputs=["portfolios_t0", "gt_drift_schedule", "landuse_factors",
+                        "income_factors", "params:land_use", "params:scenario"],
                 outputs="assignments_timeline",
                 name="evolve_assignments",
             ),

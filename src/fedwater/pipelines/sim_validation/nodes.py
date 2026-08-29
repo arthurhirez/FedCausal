@@ -15,10 +15,17 @@ Soft checks (reported, thresholds in parameters)
 -----------------------------------------------
 V4 pressure band     share of node-hours inside [p_min, p_max] (ABNT NBR
                      12218 residential band by default).
-V5 consumption sanity implied per-unit m3/month within plausible bounds,
-                     per income level.
-V6 peak factors      node daily peak factor within [k_lo, k_hi]; mean peak
-                     factor must DECREASE with density (crowd smoothing).
+V5 consumption sanity implied m3/month per RESIDENTIAL plot matches the
+                     standards table and sits in a plausible band; the two
+                     non-residential intensities are recorded.
+V6 peak factors      node daily peak factor within [k_lo, k_hi], reported per
+                     land-use class; optional ordering assertion.
+V7 calibration       recorded, NEVER a gate (see ``check_consumption_sanity``).
+
+Refactor note: V5 and V6 used to speak the density language. V5 read a
+``units`` column that no longer exists, and V6 asserted that the mean peak
+factor DECREASES with density — which was the V0 crowd-smoothing artifact and
+is meaningless once density is gone. Both are restated below in land-use terms.
 """
 from __future__ import annotations
 
@@ -62,7 +69,7 @@ def check_pressures(pressures: pd.DataFrame, demand_series: pd.DataFrame,
         raise AssertionError(
             f"V3 pressure floor violated: node {worst} reached "
             f"{p.to_numpy().min():.1f} mca (< {floor}). Demand exceeds network "
-            f"capacity — lower anchor_scale or drift intensity."
+            f"capacity — lower anchor_scale, scenario.beta, or drift intensity."
         )
     inside = ((p >= p_min) & (p <= p_max)).to_numpy().mean()
     return pd.DataFrame([
@@ -76,28 +83,78 @@ def check_pressures(pressures: pd.DataFrame, demand_series: pd.DataFrame,
 def check_consumption_sanity(assignments_timeline: pd.DataFrame,
                              income_factors: pd.DataFrame,
                              validation: dict) -> pd.DataFrame:
-    """V5: per-unit consumption by income must sit in a plausible band."""
+    """V5 (per-plot intensity) and V7 (calibration, recorded only).
+
+    V5 is a cheap plumbing assertion rather than a physical discovery. Cohort
+    plot counts are back-solved as ``sector_volume / intensity(sector)``, so
+    the implied per-plot volume is identically the intensity the portfolio
+    builder was handed. What the check is therefore worth is confirming that
+    the residential intensity actually came from ``standards_by_income`` — that
+    income is still wired to the residential sector and only to it — and that
+    the resulting number is physically plausible. The two non-residential
+    intensities are recorded without a band, since the residential band does
+    not apply to a shop or a factory.
+
+    V7 records the calibration constant. It is NOT a gate. Calibration
+    renormalises the month-0 total volume onto the anchor total, rescaling
+    every node by the same constant, so it is hydraulically a no-op; a value
+    of 0.4 only means the map's raw factors ran hot before renormalisation.
+    V0 raised outside [0.5, 2.0], which short-circuited the feasibility search
+    before it could reach the real boundary — the pressure floor.
+    """
     lo, hi = validation["unit_m3_month_band"]
-    per_node = assignments_timeline.groupby(["month", "node", "income"]).agg(
-        volume=("volume_m3_month", "first"), units=("units", "sum")).reset_index()
-    per_node["m3_per_unit"] = per_node["volume"] / per_node["units"]
+    expected = income_factors.set_index("income")["mean_unit_m3_month"]
+
+    per_plot = assignments_timeline.assign(
+        m3_per_plot=assignments_timeline["sector_volume_m3_month"]
+        / assignments_timeline["plots"])
 
     rows = []
-    for income, grp in per_node.groupby("income"):
-        med = grp["m3_per_unit"].median()
-        rows.append({"check": f"V5_unit_m3_month[{income}]", "value": float(med),
-                     "hard": False, "passed": bool(lo <= med <= hi)})
+    residential = per_plot[per_plot["sector"] == "residential"]
+    for income, grp in residential.groupby("income"):
+        med = float(grp["m3_per_plot"].median())
+        in_band = lo <= med <= hi
+        matches_table = bool(np.isclose(med, float(expected[income]), rtol=1e-6))
+        rows.append({"check": f"V5_residential_m3_month[{income}]", "value": med,
+                     "hard": False, "passed": bool(in_band and matches_table)})
+
+    for sector, grp in per_plot[per_plot["sector"] != "residential"].groupby("sector"):
+        rows.append({"check": f"V5_plot_m3_month[{sector}]",
+                     "value": float(grp["m3_per_plot"].median()),
+                     "hard": False, "passed": True})  # recorded, not gated
+
+    calib = float(assignments_timeline["calibration"].iloc[0])
+    c_lo, c_hi = validation.get("calibration_band", [-np.inf, np.inf])
+    rows.append({"check": "V7_calibration", "value": calib,
+                 "hard": False, "passed": True})       # recorded, never a gate
+    rows.append({"check": "V7_calibration_in_band", "value": calib,
+                 "hard": False, "passed": bool(c_lo <= calib <= c_hi)})
     return pd.DataFrame(rows)
 
 
 def check_peak_factors(demand_series: pd.DataFrame,
                        assignments_timeline: pd.DataFrame,
                        time: dict, validation: dict) -> pd.DataFrame:
-    """V6: daily peak factor plausible per node; decreasing with density."""
+    """V6: daily peak factor plausible per node, reported per land-use class.
+
+    V0 asserted that the mean peak factor decreases with density — the sqrt-N
+    crowd-smoothing artifact of a model where density only widened the
+    peak-time dispersion. Under the land-use model there is no such single
+    monotone story to assert a priori: a land-use CLASS is a sector MIX (the
+    ``commercial`` class still holds 35% residential plots) and cohorts are
+    mixed by VOLUME, so the node-level ordering is an emergent property of the
+    intensity table, not something readable off the sector signatures.
+
+    So the class means are always REPORTED, and the ordering is asserted only
+    if ``validation.peak_factor_order`` is set — a list of land-use codes in
+    expected DECREASING peak-factor order, to be filled in from a measured run
+    rather than guessed. Leave it unset (or null) and this node reports without
+    asserting.
+    """
     steps_day = int(round(24 / time["resolution_h"]))
     node_cols = [c for c in demand_series.columns if c != "month"]
-    density0 = assignments_timeline[assignments_timeline["month"] == 0] \
-        .drop_duplicates("node").set_index("node")["density"]
+    land_use0 = (assignments_timeline[assignments_timeline["month"] == 0]
+                 .drop_duplicates("node").set_index("node")["land_use"])
 
     vals = demand_series[node_cols].to_numpy()
     days = vals.shape[0] // steps_day
@@ -107,17 +164,24 @@ def check_peak_factors(demand_series: pd.DataFrame,
 
     k_lo, k_hi = validation["peak_factor_band"]
     in_band = float(((pf >= k_lo) & (pf <= k_hi)).mean())
-    by_density = pf.groupby(density0).mean()
-    ordered = bool(by_density.get("low", np.inf) > by_density.get("high", -np.inf))
+    by_land_use = pf.groupby(land_use0.reindex(pf.index)).mean()
 
     rows = [{"check": "V6_peak_factor_in_band", "value": in_band, "hard": False,
-             "passed": bool(in_band >= validation["peak_factor_min_share"])},
-            {"check": "V6_smoothing_low_gt_high", "value": float(
-                by_density.get("low", np.nan) - by_density.get("high", np.nan)),
-             "hard": False, "passed": ordered}]
-    for d, v in by_density.items():
-        rows.append({"check": f"V6_peak_factor[{d}]", "value": float(v),
-                     "hard": False, "passed": True})
+             "passed": bool(in_band >= validation["peak_factor_min_share"])}]
+    for land_use, v in by_land_use.items():
+        rows.append({"check": f"V6_peak_factor[{land_use}]", "value": float(v),
+                     "hard": False, "passed": True})   # recorded, not gated
+
+    order = validation.get("peak_factor_order")
+    if order:
+        present = [lu for lu in order if lu in by_land_use.index]
+        if len(present) >= 2:
+            gaps = np.diff([by_land_use[lu] for lu in present])
+            # Expected DECREASING, so every successive difference must be < 0;
+            # the reported value is the worst (largest) gap.
+            rows.append({"check": "V6_peak_factor_ordering",
+                         "value": float(gaps.max()), "hard": False,
+                         "passed": bool((gaps < 0).all())})
     return pd.DataFrame(rows)
 
 

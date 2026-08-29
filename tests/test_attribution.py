@@ -54,8 +54,8 @@ def _world(common_amp=4.0, drift_client="C_D", drift_month=10, n_months=20,
                      extra=np.nan)
                 for i, a in enumerate(CLIENTS) for b in CLIENTS[i + 1:]]
     gt = pd.DataFrame({"node": ["1"], "district": [drift_client],
-                       "drift_month": [drift_month], "to_income": ["high"],
-                       "to_density": ["low"]})
+                       "drift_month": [drift_month], "to_income": ["low"],
+                       "to_land_use": ["commercial"]})
     return (pd.DataFrame(proto_rows), pd.DataFrame(lat_rows),
             pd.DataFrame(dep_rows), gt)
 
@@ -167,7 +167,8 @@ def test_world_specs_deterministic_and_valid():
     from fedwater.pipelines.label_factory.nodes import build_world_specs
     districts = yaml.safe_load(open("data/01_raw/districts_graeme.yml"))
     fl = {"label_factory": {
-        "n_worlds": 6, "drift_incomes": ["medium", "high"],
+        "n_worlds": 6, "drift_incomes": ["low"],
+        "drift_land_uses": ["mixed", "commercial", "industrial"],
         "coupling_variants": [["baseline", 0.0], ["partial", 0.3]],
         "anchor_by_variant": {"baseline": 0.05, "partial": 0.04}}}
     a = build_world_specs(fl, districts, seed=3)
@@ -175,6 +176,7 @@ def test_world_specs_deterministic_and_valid():
     pd.testing.assert_frame_equal(a, b)
     for _, r in a.iterrows():
         assert r["drift_seed_node"] in districts["districts"][r["drift_district"]]
+        assert r["drift_to_land_use"] in fl["label_factory"]["drift_land_uses"]
     assert a["variant"].nunique() == 2
 
 

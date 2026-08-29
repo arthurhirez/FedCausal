@@ -10,7 +10,7 @@ continuing the FAPESP/BEPE work at U.Porto).
 pip install -r requirements.txt && pip install -e .
 kedro run                                        # full 24-month baseline (~25 s)
 kedro run --params "coupling.variant=isolated"   # independent-districts variant
-pytest tests/ -q                                 # 12 tests, ~5 s
+pytest -q                                        # 86 tests, ~90 s
 ```
 
 ## Pipelines
@@ -18,27 +18,69 @@ pytest tests/ -q                                 # 12 tests, ~5 s
 | pipeline           | role                                                            |
 |--------------------|-----------------------------------------------------------------|
 | `network_prep`     | explicit hydraulic options, district partition guard, coupling variants (the *dependence dial*) |
-| `urban_scenario`   | block portfolios (income -> level, density -> composition), drift diffusion schedule (**ground truth**) |
-| `demand_synthesis` | unit-level behavioural model with *emergent* crowd smoothing (sqrt-N law), calendar + seasonality, volume-exact by construction |
+| `urban_scenario`   | block portfolios (land use -> sector composition AND level, income -> residential intensity), drift diffusion schedule (**ground truth**) |
+| `demand_synthesis` | sector-level behavioural model (residential peaks / commercial plateau / industrial 24-7) with *emergent* crowd smoothing (sqrt-N law), weekly + seasonal cycles, volume-exact by construction |
 | `hydraulics`       | direct wntr/EPANET run; unit-base pattern convention makes volume bugs structurally impossible |
 | `sensing`          | sensor extraction + measurement-noise layer -> per-client CSVs  |
 | `sim_validation`   | physics checks as pipeline nodes: hard checks raise, report ships with every dataset |
 | `dependence_oracle`| topological + centralized statistical dependence ground truth   |
+
+## The demand model — land use
+
+A junction is a city block. Two attributes describe it:
+
+* **`income`** {low, medium, high} — the building-standards mix, hence the mean
+  consumption of one **residential** plot. Residential-only: income enters the
+  demand level only through the residential intensity term.
+* **`land_use`** {residential, mixed, commercial, industrial} — the block's mix
+  of sector plots, driving both level and shape.
+
+| sector | daily | weekly | night floor | weather |
+|---|---|---|---|---|
+| residential | three use peaks | weekend morning shifted + damped | 0.15 | full |
+| commercial | work-hours plateau 08-18 | near-closed Sat/Sun | 0.03 | weak |
+| industrial | 24/7 with day lift 06-22 | mild dip | 0.85 | none |
+
+A plateau is a boxcar convolved with the same Gaussian start-time jitter the
+residential peaks use, so crowd smoothing stays *derived* from 1/sqrt(N) rather
+than tuned, and plateau sectors inherit it for free. Industrial 24/7 draw
+raises the minimum night flow (the classic DMA diagnostic) while commercial
+pushes it toward zero — residential->commercial and residential->industrial are
+opposite-signed, physically interpretable drifts.
+
+Level: `volume = anchor * calibration * (mean_plot_intensity / reference) ** beta`.
+`scenario.beta` is the level dial — `0.0` is shape-only and volume-neutral,
+`1.0` is the full effect. It is a **world** axis, so gridding it re-simulates
+(see the `beta_sweep` study).
+
+Worlds name their scenario with a 5-token code in district order A-E, each
+token = income initial `{L,M,H}` + land-use initial `{R,M,C,I}` ('M' is
+disambiguated by position). The shipped map is `LR_LM_LC_LR_LR`.
 
 ## Design invariants
 
 1. **Volume exactness**: every node-month integrates exactly to its target;
    EPANET must reproduce it (checked to 1e-3 rel, observed ~5e-6).
 2. **Peak-feasible anchor**: `anchor_scale` is calibrated so the worst case
-   (seasonal peak + fully drifted high-income district) stays inside the ABNT
-   NBR 12218 pressure band. Pressures carry real signal (13-31 mca diurnal
-   swing vs ~0.2 in the legacy code).
-3. **Emergent smoothing**: aggregation over units produces the density-ordered
-   peak factors (low 2.28 > medium 1.64 > high 1.46); nothing is injected.
-4. **Ground truth is a product**: drift schedule, boundary/closure table,
+   (seasonal peak + fully drifted district) stays inside the ABNT NBR 12218
+   pressure band. On the shipped map at `beta=0.35`: network peak 661 L/s
+   against a capacity frontier near 1050-1200 L/s, min pressure 30.9 mca, max
+   48.5, 100% of node-hours in band. Pressures carry real signal.
+3. **Emergent smoothing**: aggregation over plots produces peak factors from
+   the sqrt-N law; nothing is injected. Note the node peak factor is NOT
+   monotone in commercial content (residential 2.16, commercial 2.05, mixed
+   1.83) — a mixed block fills the midday trough between the residential
+   peaks. Use the night/day ratio as the composition proxy.
+4. **Shape survives the scaler; level does not**: per-client MinMax fitted on
+   the commissioning months is affine, so it discards demand LEVEL and keeps
+   weekly gates and night floors. A residential->commercial drift shifts the
+   scaled weekly profile by 0.84 (1 - corr) at `beta=0` — with no level change
+   at all — and identically at `beta=0.5`. Level is what threatens hydraulic
+   feasibility; shape is what carries the regime information.
+5. **Ground truth is a product**: drift schedule, boundary/closure table,
    topology features, and the centralized dependence oracle are catalog
    artifacts (`gt_*`), never mixed with training data.
-5. **Reproducibility**: keyed RNGs — any single (node, month) is regenerable
+6. **Reproducibility**: keyed RNGs — any single (node, month) is regenerable
    in isolation; same seed, same dataset, bit for bit.
 
 ## Dependence battery (the centralized oracle)
@@ -169,10 +211,21 @@ legacy simulation: the sum-to-1 pattern normalisation (delivered volumes ~24x
 low), the hidden EPANET demand multiplier (0.2), and units-mixing in pattern
 smoothing. See `conf/base/parameters.yml` for every physical assumption.
 
+The `density` axis was replaced by land use. Density was volume-neutral by
+construction (node volume was a pure function of income, and the month series
+was renormalised onto it) and its hydraulic direction was backwards: higher
+density widened peak-time dispersion, flattening the aggregate at constant
+volume and so RAISING minimum pressure — a densification drift relieved the
+network instead of stressing it. Land use drives level and shape together, and
+puts the regime signature in the temporal channel the FL scaler provably
+preserves. Every world hash changed; `data/09_experiments/worlds/` must be
+re-simulated.
+
 ## Experiments engine
 
 Declarative studies (seed replication, drift-origin sweeps, consumption-map
-sweeps, the label factory) run through one engine: worlds are simulated once
+sweeps, the land-use level sweep, the label factory) run through one engine:
+worlds are simulated once
 and cached by content hash of their effective configuration; runs (FL
 training + analysis) reuse cached worlds via hardlinks, so replication costs
 FL only. Every world and run writes a `manifest.json` (resolved config,
