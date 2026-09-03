@@ -160,11 +160,16 @@ buildings:
   # residential plot intensity in the land-use model above.
   unit_m3_month: {1: 5, 2: 10, 3: 15, 4: 25, 5: 40}
   # Standards mix by income (BEPE) -> drives mean unit volume -> income factor.
-  standards_by_income:
-    low:    {1: 0.40, 2: 0.40, 3: 0.175, 4: 0.025}
-    medium: {1: 0.10, 2: 0.30, 3: 0.50, 4: 0.10}
-    high:   {3: 0.20, 4: 0.40, 5: 0.40}
+  # standards_by_income:
+  #   low:    {1: 0.40, 2: 0.40, 3: 0.175, 4: 0.025}
+  #   medium: {1: 0.10, 2: 0.30, 3: 0.50, 4: 0.10}
+  #   high:   {3: 0.20, 4: 0.40, 5: 0.40}
 
+  standards_by_income:
+    low:    {1: 0.40, 2: 0.40, 3: 0.175, 4: 0.025}   # mean 9.25 — unchanged
+    medium: {2: 0.20, 3: 0.45, 4: 0.35}              # mean 17.50 (was 13.50)
+    high:   {3: 0.10, 4: 0.30, 5: 0.60}              # mean 33.00 (was 29.00)
+    
   # ---- V0, NOT USED after the land-use refactor ----------------------------
   # Both keys belonged to the density axis: `unit_share_by_density` split a
   # node's units into building templates and `units_per_building` turned unit

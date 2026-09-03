@@ -252,3 +252,98 @@ studies:
     pipelines: [fl, dependence_detection, drift_attribution]
     harvest: [validation, drift, ladder, c4, dependence]
     retain: [prototype_history]
+
+
+
+  drift_origin_landuse_expanded:
+    description: >
+      10 worlds (drift origin A..E, auto seed node) at a 30-month horizon —
+      worlds only for now; single fl_seed kept in the run spec.
+    worlds:
+      fixed:
+        sim_seed: 42
+        n_months: 30
+        anchor_scale: 0.05
+        beta: 0.35
+        consumption_map: LR_LC_LI_LR_LR
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+      grid:
+        drift: [{tgt_district: District_A, to_income: low, to_land_use: industrial, warmup_months: 4},
+                {tgt_district: District_A, to_income: low, to_land_use: commercial, warmup_months: 4},
+
+                {tgt_district: District_B, to_income: low, to_land_use: residential, warmup_months: 4},
+                {tgt_district: District_B, to_income: low, to_land_use: industrial, warmup_months: 4},
+
+                {tgt_district: District_C, to_income: low, to_land_use: residential, warmup_months: 4},
+                {tgt_district: District_C, to_income: low, to_land_use: commercial, warmup_months: 4},
+
+                {tgt_district: District_D, to_income: low, to_land_use: industrial, warmup_months: 4},
+                {tgt_district: District_D, to_income: low, to_land_use: commercial, warmup_months: 4},
+                
+                {tgt_district: District_E, to_income: low, to_land_use: industrial, warmup_months: 4},
+                {tgt_district: District_E, to_income: low, to_land_use: commercial, warmup_months: 4}
+                ]
+    runs:
+      fixed: {rounds: 8, step_size: 3, batch_size: 128,
+              n_surrogates: 40, n_surrogates_expensive: 15, fl_seed: 0}
+    pipelines: [fl, dependence_detection, drift_attribution]
+    harvest: [validation, drift, ladder, c4, dependence]
+    retain: [prototype_history]
+
+
+  drift_origin_landuse_expanded_V4:
+    description: >
+      10 worlds (drift origin A..E, auto seed node) at a 30-month horizon —
+      worlds only for now; single fl_seed kept in the run spec.
+    worlds:
+      fixed:
+        sim_seed: 42
+        n_months: 30
+        anchor_scale: 0.05
+        beta: 0.35
+        consumption_map: LR_LI_LI_LC_LR
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20 
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+      grid:
+        drift: [{tgt_district: District_A, to_income: low, to_land_use: industrial, warmup_months: 4},
+                {tgt_district: District_A, to_income: low, to_land_use: commercial, warmup_months: 4},
+
+                {tgt_district: District_B, to_income: low, to_land_use: residential, warmup_months: 4},
+                {tgt_district: District_B, to_income: low, to_land_use: commercial, warmup_months: 4},
+
+                {tgt_district: District_C, to_income: low, to_land_use: residential, warmup_months: 4},
+                {tgt_district: District_C, to_income: low, to_land_use: commercial, warmup_months: 4},
+
+                {tgt_district: District_D, to_income: low, to_land_use: industrial, warmup_months: 4},
+                {tgt_district: District_D, to_income: low, to_land_use: residential, warmup_months: 4},
+                
+                {tgt_district: District_E, to_income: low, to_land_use: industrial, warmup_months: 4},
+                {tgt_district: District_E, to_income: low, to_land_use: commercial, warmup_months: 4}
+                ]
+    runs:
+      fixed: {rounds: 8, step_size: 3, batch_size: 128,
+              n_surrogates: 40, n_surrogates_expensive: 15, fl_seed: 0}
+    pipelines: [fl]
+    harvest: [validation, drift]
+    retain: [prototype_history]    
+
+
+  resolution_probe:
+    worlds:
+      fixed:
+        n_months: 6                    # 4x the steps per month, so shorten
+        consumption_map: LR_LC_LC_LI_LR
+      grid:
+        sim_overrides:
+          - time: {resolution_h: 1}       # baseline, for comparison
+          - time: {resolution_h: 0.25}    # 15 min -> 96 steps/day
+          - time: {resolution_h: 0.125}   # 7.5 min -> 192 steps/day
+    runs:
+      fixed: {rounds: 1}
