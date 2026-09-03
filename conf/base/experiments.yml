@@ -347,3 +347,394 @@ studies:
           - time: {resolution_h: 0.125}   # 7.5 min -> 192 steps/day
     runs:
       fixed: {rounds: 1}
+
+
+  # --------------------------------------------------- truncation probe --
+  # Gating check before building the robustness study: does a 48-month world
+  # contain the same first 36 months as a 36-month world?
+  #
+  # If YES, horizon is a pure suffix and window slicing in analysis is
+  # legitimate; the 48-month world subsumes every shorter one, and results
+  # stay comparable to the existing 30-month studies.
+  # If NO, the RNG stream (or the drift schedule) depends on the horizon, and
+  # n_months becomes a genuine world axis that cannot be sliced.
+  #
+  # The 48-month arm is deliberately hash-identical to S1/drift-D of the
+  # robustness study, so a pass banks that world instead of discarding it.
+  truncation_probe:
+    description: >
+      2 worlds (36 vs 48 months) identical in every other respect; worlds
+      only. Verifies horizon is a suffix, not a reparameterisation.
+    worlds:
+      fixed:
+        sim_seed: 42
+        anchor_scale: 0.05
+        beta: 0.35
+        consumption_map: LR_LR_LR_LR_LI
+        coupling: {variant: baseline, close_fraction: 0.0}
+        drift: {tgt_district: District_D, to_income: low,
+                to_land_use: industrial, warmup_months: 12}
+        # frozen generous block — must match the robustness study exactly or
+        # the 48-month world will not be reusable
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+      grid:
+        n_months: [36, 48]
+    runs:
+      fixed: {rounds: 1}      
+
+
+
+
+
+
+
+
+
+
+
+
+# =========================================================================
+# JACOBIAN VALIDATION SUITE (jval_*) — append to `studies:` in experiments.yml
+#
+# Measurand. Does interventional unmixing (d = J^+ y, sensitivity_probe.py)
+# recover district-demand dependence, and does it survive a regime change?
+#
+#   M1  correlation-matrix recovery      -> scale-blind, shape-sensitive
+#         rank_corr + MAE of pairwise rho(d_hat) vs rho(d_true), and gap
+#         retention G_hat/G_true where G = mean rho(same-state pairs)
+#                                      - mean rho(diff-state pairs).
+#         Reads LAND USE.
+#   M2  amplitude recovery               -> shape-blind, scale-sensitive
+#         r[d] = log(std(d_hat[d]) / std(d_true[d])). J carries a global
+#         scale factor, so mean(r) is UNIDENTIFIABLE and diagnostic only;
+#         report std(r) across districts and the Spearman rank of districts
+#         by amplitude. Reads INCOME — the axis per-client MinMax destroys
+#         in the FL artifacts but which a linear inverse preserves.
+#
+# WORLDS ONLY. The measurands need `demand_series.parquet`, `flows.parquet`,
+# `pressures.parquet` and `gt_drift_schedule.csv` — no FL artifacts, no
+# prototypes. `pipelines` / `harvest` / `retain` are run-side and do NOT
+# enter the world hash, so they are omitted here and can be added later
+# without re-simulating (see `resolution_probe` for the same pattern).
+#
+# The `oracle` block is FROZEN to match d0_replication. It is hashed, so
+# trimming it now to save build time would force a full re-simulation the
+# first time anyone wants the full battery on these worlds.
+#
+# ---- horizon and windows ------------------------------------------------
+# Verified empirically (45 existing worlds, gt_drift_schedule.csv):
+#   * onset == warmup_months exactly
+#   * front = seed alone, then max_neighbors_per_month=2 per advance,
+#     advancing with growth_chance=0.8
+#     -> active_months = 1 + ceil((n_nodes - 1) / 2), matched exactly for
+#        all five districts (A 7, C 10, D 13, B 15, E 16)
+#   * span is INDEPENDENT of warmup_months (D: span 18 at warmup 4 and 12)
+#   * the schedule is DETERMINISTIC at fixed sim_seed — identical onset,
+#     completion and stall pattern across all 8 worlds per district. The
+#     conversion path therefore contributes ZERO variance to every existing
+#     result; `sim_seed` below is the only axis that varies it.
+#   * horizon is a proven pure SUFFIX (36mo vs 48mo bitwise identical over
+#     the shared 36 months, drift onset inside the overlap). So n_months is
+#     NOT gridded: 48 subsumes every shorter horizon and short-horizon
+#     results are window selections made in analysis.
+#
+# n_months: 48, warmup_months: 6 gives:
+#   pre         months  0..5    (4 320 steps; onset at 6, so uncontaminated)
+#   transition  months  6..35
+#   post        months 36..41   (4 320 steps; 36 == 0 mod 12, so pre and
+#                                post cover the same calendar months and
+#                                the seasonal cycle cancels)
+#   spare       months 42..47
+# Worst case is District_E: 16 advances at p=0.8 -> p99 span ~26 months,
+# completion ~32 including the 42-day ramp. Post window clears it by ~4
+# months. 42 would be the bare minimum; 48 buys the margin.
+#
+# ---- analysis-side arms (no world cost) ---------------------------------
+#   J_flat       J from .inp base demands            (what section 13 used)
+#   J_pre        flat probe at pre-drift mean demand (commissioning-time J)
+#   J_post       flat probe at post-drift mean demand (recommissioned J)
+#   J_pre_wpost  J_pre structure, post-drift node_weights (composition only)
+#   J_perm       district columns of Jd shuffled     (falsification control)
+# If J_pre holds in the post window, the deployment claim becomes
+# "commission once, no recalibration after a regime change".
+#
+# ---- per-world assertions (run before including any world) --------------
+#   len(sch) == n_nodes[tgt]                  # front completed
+#   sch.drift_month.max() + 1.4 < 36          # completed before post window
+#   sch.drift_month.min() >= 6                # pre window uncontaminated
+# These three lines would have caught the resolution_probe truncation
+# (5/24 nodes converted, ramp clamped to 29 of 42 days).
+#
+# ---- feasibility note ---------------------------------------------------
+# industrial mean plot intensity = 0.20*1 + 0.30*2.5 + 0.50*8 = 4.95, so
+# level_factor = 4.95^beta. At beta=0.35 an industrial district draws ~1.76x
+# a low-residential one. S1/S2 maps already contain industrial districts, so
+# a drift TO industrial puts two in play at once — the parameters.yml note
+# ("use 0.25 if several districts drift together") applies. V1-V3 raise on
+# infeasibility; at beta=1.0 (jval_beta) a failure is a RECORDED OUTCOME,
+# not a bug to work around.
+# =========================================================================
+
+  # ------------------------------------------------- S1: odd-one-out ------
+  # 4 clients in one state + 1 different; one client drifts to the odd
+  # state. Pre-drift truth: {A,B,C,D} mutually similar, E apart.
+  #
+  # Two properties make this the strongest arm:
+  #   (1) INVARIANCE NULL. When D drifts, rho(A,B), rho(A,C), rho(B,C) are
+  #       unchanged by construction. Any movement in the ESTIMATED value is
+  #       pure method error, measured with no ground-truth ambiguity.
+  #   (2) SIGNED PREDICTION. rho(D,E) must rise; rho(D,{A,B,C}) must fall.
+  #       Recovering the signed CHANGE induced by a known intervention is a
+  #       causal validation, not a correlational one.
+  #
+  # METRIC WARNING: with four identical districts, 6 of the 10 true pairwise
+  # correlations are tied at ~1, so Spearman over 10 points is near-
+  # uninformative. MAE and gap retention are primary here; rank_corr is
+  # reported but must not carry the claim.
+  #
+  # District_E -> residential is the mirror case (all five converge, truth
+  # becomes fully degenerate). Kept deliberately as the extreme: MAE stays
+  # well defined where rank_corr cannot.
+  #
+  # seed_node omitted -> auto-picked (largest-base-demand junction, skipping
+  # zero-demand trunk nodes). Verified to give A 61 / B 93 / C 59 / D 2 / E 7,
+  # which are the nodes the front calendar above was characterised on.
+  jval_s1_oddone:
+    description: >
+      Odd-one-out convergence: LR x4 + LI, one client drifts to industrial.
+      5 drift origins x 3 sim seeds, worlds only, 48-month horizon.
+    worlds:
+      fixed:
+        n_months: 48
+        anchor_scale: 0.05
+        beta: 0.35
+        consumption_map: LR_LR_LR_LR_LI
+        coupling: {variant: baseline, close_fraction: 0.0}
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+      grid:
+        sim_seed: [42, 43, 44]
+        drift:
+          # convergence: a residential client joins the industrial one
+          - {tgt_district: District_A, to_income: low, to_land_use: industrial,
+             warmup_months: 6}
+          - {tgt_district: District_B, to_income: low, to_land_use: industrial,
+             warmup_months: 6}
+          - {tgt_district: District_C, to_income: low, to_land_use: industrial,
+             warmup_months: 6}
+          - {tgt_district: District_D, to_income: low, to_land_use: industrial,
+             warmup_months: 6}
+          # mirror: the odd one joins the majority -> degenerate post truth
+          - {tgt_district: District_E, to_income: low, to_land_use: residential,
+             warmup_months: 6}
+    runs:
+      fixed: {rounds: 1}
+
+  # ------------------------------------------------- S2: 3-2 split --------
+  # Two internally homogeneous groups (A,B,C residential | D,E industrial);
+  # one client crosses. Better-conditioned truth than S1: 4 same-state pairs
+  # and 6 different-state pairs, so the gap statistic G is estimated from
+  # both cells rather than from one.
+  #
+  # A/B/C -> industrial makes it 2-3; D/E -> residential makes it 4-1. Both
+  # directions are present so the sign of the predicted change alternates.
+  jval_s2_split:
+    description: >
+      3-2 group split: LR x3 + LI x2, one client crosses. 5 crossings x 3
+      sim seeds, worlds only, 48-month horizon.
+    worlds:
+      fixed:
+        n_months: 48
+        anchor_scale: 0.05
+        beta: 0.35
+        consumption_map: LR_LR_LR_LI_LI
+        coupling: {variant: baseline, close_fraction: 0.0}
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+      grid:
+        sim_seed: [42, 43, 44]
+        drift:
+          # 3-2 -> 2-3
+          - {tgt_district: District_A, to_income: low, to_land_use: industrial,
+             warmup_months: 6}
+          - {tgt_district: District_B, to_income: low, to_land_use: industrial,
+             warmup_months: 6}
+          - {tgt_district: District_C, to_income: low, to_land_use: industrial,
+             warmup_months: 6}
+          # 3-2 -> 4-1
+          - {tgt_district: District_D, to_income: low, to_land_use: residential,
+             warmup_months: 6}
+          - {tgt_district: District_E, to_income: low, to_land_use: residential,
+             warmup_months: 6}
+    runs:
+      fixed: {rounds: 1}
+
+  # ---------------------------------------------------- income (M2) ------
+  # Land use held at RESIDENTIAL throughout, so shape is constant and the
+  # only thing that moves is level: low 9.25 -> high 33.00 m3/month/unit, a
+  # ~3.6x amplitude step.
+  #
+  # M1 IS BLIND HERE BY CONSTRUCTION. Pearson is scale-invariant, so
+  # rho_true(LR, HR) == rho_true(LR, LR) and the correlation matrix does not
+  # move. That is the point: this arm exists to exercise M2, and M1 on it is
+  # a NULL CONTROL — if M1 changes across the drift, that is method error.
+  #
+  # District_C -> high joins E (convergence); District_E -> low joins the
+  # majority (mirror), matching S1's structure on the income axis.
+  jval_income:
+    description: >
+      Pure income contrast, land use held residential: LR x4 + HR. 2 drift
+      origins x 3 sim seeds. Exercises M2 (amplitude); M1 is a null control.
+    worlds:
+      fixed:
+        n_months: 48
+        anchor_scale: 0.05
+        beta: 0.35
+        consumption_map: LR_LR_LR_LR_HR
+        coupling: {variant: baseline, close_fraction: 0.0}
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+      grid:
+        sim_seed: [42, 43, 44]
+        drift:
+          - {tgt_district: District_C, to_income: high, to_land_use: residential,
+             warmup_months: 6}
+          - {tgt_district: District_E, to_income: low, to_land_use: residential,
+             warmup_months: 6}
+    runs:
+      fixed: {rounds: 1}
+
+  # ------------------------------------------------ beta: the mechanism --
+  # WHY J degrades, not just whether. beta dials the land-use LEVEL effect:
+  #   beta = 0.0  volume-neutral. The drift changes SHAPE only, so the
+  #               operating point barely moves and J should stay valid.
+  #               This is the control.
+  #   beta = 0.35 shipped default.
+  #   beta = 1.0  full level effect -> largest operating-point excursion,
+  #               where h ~ Q^1.85 curvature should bite hardest. Highest
+  #               feasibility risk; a V1-V3 failure here is a result.
+  # Monotone degradation in beta identifies the operating point as the
+  # cause. One drift config and one seed — this arm is about the dial, and
+  # cross-seed spread comes from S1/S2.
+  jval_beta:
+    description: >
+      Level dial at fixed everything else: 3 betas (0 / 0.35 / 1.0), one
+      drift origin, one sim seed. Separates shape-carried from
+      level-carried degradation of the Jacobian.
+    worlds:
+      fixed:
+        sim_seed: 42
+        n_months: 48
+        anchor_scale: 0.05
+        consumption_map: LR_LR_LR_LR_LI
+        coupling: {variant: baseline, close_fraction: 0.0}
+        drift: {tgt_district: District_D, to_income: low,
+                to_land_use: industrial, warmup_months: 6}
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+      grid:
+        beta: [0.0, 0.35, 1.0]
+    runs:
+      fixed: {rounds: 1}
+
+  # ------------------------------------- coupling: the falsification -----
+  # With close_fraction 1.0 the districts are hydraulically separated, so
+  # mixing ~ 0. Raw sensors should then ALREADY recover the truth and
+  # unmixing should show NEAR-ZERO GAIN. If the gain persists on isolated
+  # worlds, our attribution of it to hydraulic mixing is wrong — this is the
+  # single strongest available test that the +0.435 result means what we
+  # say it means.
+  #
+  # The `baseline` arm is declared deliberately: every field matches
+  # jval_s1_oddone at sim_seed 42, so those two worlds are CACHE HITS and
+  # cost nothing while giving an exactly paired baseline/isolated contrast.
+  jval_coupling:
+    description: >
+      Baseline vs isolated coupling on two S1 drift origins, one sim seed.
+      Predicts near-zero unmixing gain when there is no mixing to undo.
+    worlds:
+      fixed:
+        sim_seed: 42
+        n_months: 48
+        anchor_scale: 0.05
+        beta: 0.35
+        consumption_map: LR_LR_LR_LR_LI
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+      grid:
+        coupling: [{variant: baseline, close_fraction: 0.0},
+                   {variant: isolated, close_fraction: 1.0}]
+        drift:
+          # A is the trunk (carries 1.00 of every district's demand);
+          # E is the parallel-supply end of the chain. The two extremes.
+          - {tgt_district: District_A, to_income: low, to_land_use: industrial,
+             warmup_months: 6}
+          - {tgt_district: District_E, to_income: low, to_land_use: residential,
+             warmup_months: 6}
+    runs:
+      fixed: {rounds: 1}
+
+  # ------------------------------------ OPTIONAL: equalised front --------
+  # Transition duration is a DETERMINISTIC function of district size
+  # (active_months = 1 + ceil((n-1)/2)), and size is itself collinear with
+  # hydraulic position. So "which district drifts" bundles size, position
+  # and conversion rate with no way to separate them across five districts.
+  #
+  # Tuning max_neighbors_per_month per district equalises active months at
+  # 8, breaking that tie:
+  #   A 12 nodes -> 2 | C 18 -> 3 | D 24 -> 4 | B 29 -> 4 | E 30 -> 5
+  # The cost is that "the same drift" now means a WIDER front per month in
+  # the larger districts, so spatial character differs instead of duration.
+  # Run this only if a per-district difference shows up in S1/S2 and needs
+  # de-confounding — it is a follow-up, not part of the main design.
+  jval_s1_equalised:
+    description: >
+      OPTIONAL follow-up. S1 with max_neighbors_per_month tuned per district
+      so every front spans 8 active months. De-confounds transition duration
+      from district size. One sim seed.
+    worlds:
+      fixed:
+        sim_seed: 42
+        n_months: 48
+        anchor_scale: 0.05
+        beta: 0.35
+        consumption_map: LR_LR_LR_LR_LI
+        coupling: {variant: baseline, close_fraction: 0.0}
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+      grid:
+        drift:
+          - {tgt_district: District_A, to_income: low, to_land_use: industrial,
+             warmup_months: 6, max_neighbors_per_month: 2}
+          - {tgt_district: District_B, to_income: low, to_land_use: industrial,
+             warmup_months: 6, max_neighbors_per_month: 4}
+          - {tgt_district: District_C, to_income: low, to_land_use: industrial,
+             warmup_months: 6, max_neighbors_per_month: 3}
+          - {tgt_district: District_D, to_income: low, to_land_use: industrial,
+             warmup_months: 6, max_neighbors_per_month: 4}
+          - {tgt_district: District_E, to_income: low, to_land_use: residential,
+             warmup_months: 6, max_neighbors_per_month: 5}
+    runs:
+      fixed: {rounds: 1}      
