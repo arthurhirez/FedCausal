@@ -503,6 +503,8 @@ studies:
   # seed_node omitted -> auto-picked (largest-base-demand junction, skipping
   # zero-demand trunk nodes). Verified to give A 61 / B 93 / C 59 / D 2 / E 7,
   # which are the nodes the front calendar above was characterised on.
+
+  
   jval_s1_oddone:
     description: >
       Odd-one-out convergence: LR x4 + LI, one client drifts to industrial.
