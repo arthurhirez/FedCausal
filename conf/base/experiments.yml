@@ -361,7 +361,7 @@ studies:
   #
   # The 48-month arm is deliberately hash-identical to S1/drift-D of the
   # robustness study, so a pass banks that world instead of discarding it.
-  truncation_probe:
+  truncation_probe_V2:
     description: >
       2 worlds (36 vs 48 months) identical in every other respect; worlds
       only. Verifies horizon is a suffix, not a reparameterisation.
@@ -370,10 +370,10 @@ studies:
         sim_seed: 42
         anchor_scale: 0.05
         beta: 0.35
-        consumption_map: LR_LR_LR_LR_LI
+        consumption_map: LI_LR_LR_LR_LI
         coupling: {variant: baseline, close_fraction: 0.0}
         drift: {tgt_district: District_D, to_income: low,
-                to_land_use: industrial, warmup_months: 12}
+                to_land_use: industrial, warmup_months: 6}
         # frozen generous block — must match the robustness study exactly or
         # the 48-month world will not be reusable
         oracle:
@@ -382,7 +382,7 @@ studies:
           n_surrogates_expensive: 8
           minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
       grid:
-        n_months: [36, 48]
+        n_months: [30]
     runs:
       fixed: {rounds: 1}      
 
@@ -392,7 +392,35 @@ studies:
 
 
 
-
+  explore_transformations:
+    description: >
+      10 worlds (drift origin A..E, auto seed node) at a 30-month horizon —
+      worlds only for now; single fl_seed kept in the run spec.
+    worlds:
+      fixed:
+        sim_seed: 42
+        n_months: 30
+        anchor_scale: 0.05
+        beta: 0.35
+        consumption_map: LI_LI_LR_LR_LR
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20 
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+      grid:
+        drift: [{tgt_district: District_A, to_income: low, to_land_use: residential, warmup_months: 4},
+                {tgt_district: District_B, to_income: low, to_land_use: residential, warmup_months: 4},
+                {tgt_district: District_C, to_income: low, to_land_use: industrial, warmup_months: 4},
+                {tgt_district: District_D, to_income: low, to_land_use: industrial, warmup_months: 4},
+                {tgt_district: District_E, to_income: low, to_land_use: industrial, warmup_months: 4},
+                ]
+    runs:
+      fixed: {rounds: 8, step_size: 3, batch_size: 128,
+              n_surrogates: 40, n_surrogates_expensive: 15, fl_seed: 0}
+    pipelines: [fl]
+    harvest: [validation, drift]
+    retain: [prototype_history] 
 
 
 
