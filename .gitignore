@@ -165,9 +165,9 @@ mlruns/*
 data/09_experiments/
 
 # Sandbox
-notebooks/prospection/model_sandbox
-notebooks/prospection/fed_sandbox/
-notebooks/prospection/latent_sandbox/
+notebooks/0_prospection/model_sandbox
+notebooks/0_prospection/fed_sandbox/
+notebooks/0_prospection/latent_sandbox/
 
 # EPANET scratch files written to the working directory during runs
 temp.inp

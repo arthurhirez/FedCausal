@@ -424,7 +424,97 @@ studies:
 
 
 
+  explore_transformations_V2:
+    description: >
+      10 worlds (drift origin A..E, auto seed node) at a 30-month horizon —
+      worlds only for now; single fl_seed kept in the run spec.
+    worlds:
+      fixed:
+        sim_seed: 42
+        n_months: 30
+        anchor_scale: 0.05
+        beta: 0.35
+        consumption_map: LI_LR_LI_LR_LI
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20 
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+      grid:
+        drift: [{tgt_district: District_A, to_income: low, to_land_use: residential, warmup_months: 4},
+                {tgt_district: District_B, to_income: low, to_land_use: industrial, warmup_months: 4},
+                {tgt_district: District_C, to_income: low, to_land_use: residential, warmup_months: 4},
+                {tgt_district: District_D, to_income: low, to_land_use: industrial, warmup_months: 4},
+                {tgt_district: District_E, to_income: low, to_land_use: residential, warmup_months: 4},
+                ]
+    runs:
+      fixed: {rounds: 8, step_size: 3, batch_size: 128,
+              n_surrogates: 40, n_surrogates_expensive: 15, fl_seed: 0}
+    pipelines: [fl]
+    harvest: [validation, drift]
+    retain: [prototype_history] 
 
+  explore_transformations_V3:
+    description: >
+      10 worlds (drift origin A..E, auto seed node) at a 30-month horizon —
+      worlds only for now; single fl_seed kept in the run spec.
+    worlds:
+      fixed:
+        sim_seed: 42
+        n_months: 30
+        anchor_scale: 0.05
+        beta: 0.35
+        consumption_map: LR_LI_LI_LR_LI
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20 
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+      grid:
+        drift: [{tgt_district: District_A, to_income: low, to_land_use: industrial, warmup_months: 4},
+                {tgt_district: District_B, to_income: low, to_land_use: residential, warmup_months: 4},
+                {tgt_district: District_C, to_income: low, to_land_use: residential, warmup_months: 4},
+                {tgt_district: District_D, to_income: low, to_land_use: industrial, warmup_months: 4},
+                {tgt_district: District_E, to_income: low, to_land_use: residential, warmup_months: 4},
+                ]
+    runs:
+      fixed: {rounds: 8, step_size: 3, batch_size: 128,
+              n_surrogates: 40, n_surrogates_expensive: 15, fl_seed: 0}
+    pipelines: [fl]
+    harvest: [validation, drift]
+    retain: [prototype_history] 
+
+
+
+  explore_transformations_V4:
+    description: >
+      worlds (drift origin A..E, auto seed node) at a 30-month horizon —
+      worlds only for now; single fl_seed kept in the run spec.
+    worlds:
+      fixed:
+        sim_seed: 42
+        n_months: 30
+        anchor_scale: 0.05
+        beta: 0.35
+        consumption_map: LR_LR_LR_LI_LI
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20 
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+      grid:
+        drift: [{tgt_district: District_A, to_income: low, to_land_use: industrial, warmup_months: 4},
+                {tgt_district: District_B, to_income: low, to_land_use: industrial, warmup_months: 4},
+                {tgt_district: District_C, to_income: low, to_land_use: industrial, warmup_months: 4},
+                {tgt_district: District_D, to_income: low, to_land_use: residential, warmup_months: 4},
+                {tgt_district: District_E, to_income: low, to_land_use: residential, warmup_months: 4},
+                ]
+    runs:
+      fixed: {rounds: 8, step_size: 3, batch_size: 128,
+              n_surrogates: 40, n_surrogates_expensive: 15, fl_seed: 0}
+    pipelines: [fl]
+    harvest: [validation, drift]
+    retain: [prototype_history]
 # =========================================================================
 # JACOBIAN VALIDATION SUITE (jval_*) — append to `studies:` in experiments.yml
 #
