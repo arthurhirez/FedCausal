@@ -168,6 +168,7 @@ data/09_experiments/
 notebooks/0_prospection/model_sandbox
 notebooks/0_prospection/fed_sandbox/
 notebooks/0_prospection/latent_sandbox/
+notebooks/prospection/lab_sandbox/
 
 # EPANET scratch files written to the working directory during runs
 temp.inp
