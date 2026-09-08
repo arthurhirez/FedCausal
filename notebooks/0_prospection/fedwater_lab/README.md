@@ -129,3 +129,8 @@ never rank or gate a cell.
 * **Noise determinism.** `train.assert_determinism` raises if `noise=True` without
   `PYTHONHASHSEED` set, because `sensing.add_measurement_noise` keys its RNG on
   `hash(sensor)`.
+* **Device.** `TrainCfg.device` defaults to `"auto"` and is stored literally in the run key,
+  so keys are portable across machines; the *resolved* device (plus the torch version) goes in
+  `meta.json`, because CPU and GPU do not agree to the last digit. Pin `device="cpu"` when a
+  comparison has to be bit-comparable across machines — at `lstm_units=30` with 5 clients CPU
+  is often the faster choice anyway.

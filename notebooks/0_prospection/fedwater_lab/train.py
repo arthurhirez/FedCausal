@@ -79,6 +79,22 @@ def assert_determinism(noise: bool) -> None:
             "interpreter starts, or the run key is not reproducible.")
 
 
+def flatten_rnn_weights(*models) -> None:
+    """Restore each LSTM's flat contiguous weight buffer.
+
+    `FPLTrainer` broadcasts the global init with `copy.deepcopy`, and FedAvg
+    reloads state dicts every round; both leave an `nn.LSTM`'s `_flat_weights`
+    non-contiguous. On CPU that is invisible, but cuDNN then has to compact
+    the weights on every forward and warns about it ("RNN module weights are
+    not part of single contiguous chunk of memory"). Harmless numerically,
+    wasteful per batch -- so re-flatten after any weight surgery.
+    """
+    for m in models:
+        for mod in m.modules():
+            if isinstance(mod, torch.nn.RNNBase):
+                mod.flatten_parameters()
+
+
 def _flat_delta(local: dict, ref: dict) -> np.ndarray:
     """Flattened `w_local - w_ref` over the state dict, in key order."""
     return np.concatenate([(local[k] - ref[k]).detach().cpu()
@@ -98,6 +114,7 @@ def _make_trainer_class():
                      snapshot_rounds="sparse", points: int = 1500,
                      verbose: bool = False):
             super().__init__(client_windows, fl, seed)
+            flatten_rnn_weights(self.global_model, *self.models.values())
             self.starts = {c: np.asarray(client_windows[c]["window_start_step"])
                            for c in self.clients}
             self.n_rounds = int(rounds)
@@ -184,6 +201,7 @@ def _make_trainer_class():
                                       / (norms[a] * norms[b])),
                             norm_a=norms[a], norm_b=norms[b]))
             super()._fedavg(online)
+            flatten_rnn_weights(self.global_model, *self.models.values())
             if self._current_round in self.snap_rounds:
                 for c in self.clients:                    # global view
                     self._snapshot(c, self._current_round, "post")
@@ -371,6 +389,12 @@ def run_cell(world: World, spec: CellSpec, fl_windows=None, scalers=None,
             "models": {"global": tr.global_model.state_dict(),
                        **{c: tr.models[c].state_dict() for c in tr.clients}},
             "meta": {"lstm_units": fl["model"]["lstm_units"],
+                     # The spec keeps the literal "auto" so run keys stay
+                     # portable across machines; the RESOLVED device is
+                     # recorded here, because CPU and GPU do not agree to the
+                     # last digit and a cache hit should say which produced it.
+                     "device": fl["training"]["device"],
+                     "torch": torch.__version__,
                      "window_size": tr.global_model.window_size,
                      "n_features": tr.global_model.head.out_features,
                      "latent_dim": tr.global_model.latent_dim,
