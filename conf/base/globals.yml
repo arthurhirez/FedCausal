@@ -1,0 +1,16 @@
+# =========================================================================
+# The one switch. `network` names a bundle directory under data/01_raw/,
+# which must contain:
+#
+#   network.inp     the EPANET model
+#   districts.yml   districts (junction partition) + assets (tanks/reservoirs)
+#   profile.yml     sensors, source units, optional drift seed nodes
+#
+# It is interpolated into catalog filepaths as ${globals:network}. Override it
+# for a single run without editing this file by writing conf/local/globals.yml
+# -- which is exactly what the experiments engine does, so `network` is a
+# world axis and enters the world content hash.
+#
+# Available bundles: graeme, dtown
+# =========================================================================
+network: graeme

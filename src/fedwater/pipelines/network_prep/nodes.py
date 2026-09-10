@@ -1,7 +1,10 @@
 """Network preparation: hydraulic options, district partition, coupling variants.
 
 Units note (wntr): the model stores demands in SI (m3/s) regardless of the
-``.inp`` unit system; pressures are meters of water column (mca).
+``.inp`` unit system, so a GPM file and an LPS file arrive identically;
+pressures are meters of water column (mca). Option pinning is delegated to
+``fedwater.networks.options`` so the assessment pipeline certifies the same
+model this builds.
 """
 from __future__ import annotations
 
@@ -10,61 +13,47 @@ import copy
 import pandas as pd
 import wntr
 
+from fedwater.networks import options as opt
+from fedwater.networks.partition import (
+    district_nodes,
+    validate_partition,
+)
+
 
 def configure_network(wn, hydraulics: dict, time: dict):
     """Set *explicit* hydraulic and time options.
 
-    Rationale: Graeme.inp carries a hidden global ``Demand Multiplier = 0.2``.
+    Rationale: Graeme's .inp carries a hidden global ``Demand Multiplier = 0.2``.
     Every option that affects physics is pinned here, from parameters, so the
     simulation never depends on silent defaults baked into the input file.
+
+    The multiplier is PINNED, never folded into the base demands. That is a
+    deliberate asymmetry with the assessment pipeline, which folds it so that
+    lambda is its only knob: ``build_portfolios`` derives every node's demand
+    anchor from the RAW .inp base demand, so folding here would rescale the
+    entire scenario by the file's own multiplier (5x on Graeme). The assessment
+    reports base demand under both conventions for exactly this reason.
+
+    Junction demand patterns are left alone: ``run_hydraulics`` replaces all of
+    them with the synthesized series. Reservoir-head and pump-speed patterns are
+    also untouched, which matters for networks that have them (D-Town ships 140
+    patterns and 11 pumps) and is next-stage work.
     """
     wn = copy.deepcopy(wn)
-    wn.options.hydraulic.demand_multiplier = float(hydraulics["demand_multiplier"])
-    wn.options.hydraulic.demand_model = hydraulics["demand_model"]  # 'DD' or 'PDD'
+    opt.check_headloss(wn, hydraulics.get("expected_headloss", "H-W"))
+    opt.pin_inpfile_units(wn, hydraulics.get("inpfile_units", "LPS"))
+    opt.pin_demand_multiplier(wn, float(hydraulics["demand_multiplier"]))
+    opt.pin_demand_model(wn, hydraulics["demand_model"])  # 'DD' or 'PDD'
 
-    horizon_h = int(time["n_months"] * time["days_per_month"] * 24)
-    step_s = int(time["resolution_h"] * 3600)
-    wn.options.time.duration = horizon_h * 3600
-    wn.options.time.hydraulic_timestep = step_s
-    wn.options.time.pattern_timestep = step_s
-    wn.options.time.report_timestep = step_s
+    horizon_h = float(time["n_months"] * time["days_per_month"] * 24)
+    opt.pin_time(wn, horizon_h, int(time["resolution_h"] * 3600))
     return wn
-
-
-def validate_partition(wn, districts: dict) -> pd.DataFrame:
-    """Hard sanity: districts must exactly partition the junction set.
-
-    Raises on overlap / missing / unknown nodes; returns a coverage report.
-    """
-    districts = districts["districts"]
-    all_junctions = set(wn.junction_name_list)
-
-    seen: set[str] = set()
-    overlaps: set[str] = set()
-    for nodes in districts.values():
-        dup = seen & set(nodes)
-        overlaps |= dup
-        seen |= set(nodes)
-
-    missing = all_junctions - seen
-    unknown = seen - all_junctions
-    if overlaps or missing or unknown:
-        raise ValueError(
-            f"District partition invalid — overlaps={sorted(overlaps)}, "
-            f"missing={sorted(missing)}, unknown={sorted(unknown)}"
-        )
-
-    report = pd.DataFrame(
-        [{"district": d, "n_nodes": len(n)} for d, n in districts.items()]
-    )
-    report["total_nodes"] = len(all_junctions)
-    return report
 
 
 def _boundary_pipes(wn, districts: dict) -> pd.DataFrame:
     """All pipes whose endpoints belong to two different districts."""
     node_to_district = {
-        n: d for d, nodes in districts["districts"].items() for n in nodes
+        n: d for d, nodes in district_nodes(districts).items() for n in nodes
     }
     rows = []
     for name in wn.pipe_name_list:
@@ -146,7 +135,7 @@ def apply_coupling(wn, districts: dict, coupling: dict, seed: int):
 
     if variant == "isolated":
         src_head = wn.get_node(wn.reservoir_name_list[0]).base_head
-        for i, (district, nodes) in enumerate(districts["districts"].items()):
+        for i, (district, nodes) in enumerate(district_nodes(districts).items()):
             res_name, pipe_name = f"R_{district}", f"PR_{district}"
             wn.add_reservoir(res_name, base_head=src_head)
             # Feed each district at its first node through a short, wide pipe.

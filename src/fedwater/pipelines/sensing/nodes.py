@@ -12,8 +12,13 @@ import pandas as pd
 
 
 def extract_sensor_series(pressures: pd.DataFrame, flows: pd.DataFrame,
-                          sensors: dict) -> pd.DataFrame:
-    """Long tidy frame: step, month, district, sensor, kind, value (true)."""
+                          network_profile: dict) -> pd.DataFrame:
+    """Long tidy frame: step, month, district, sensor, kind, value (true).
+
+    Sensor placement comes from the network profile, not from parameters:
+    which node carries a gauge is a fact about the network.
+    """
+    sensors = network_profile["sensors"]
     frames = []
     for district, cfg in sensors.items():
         for node in cfg["pressure"]:

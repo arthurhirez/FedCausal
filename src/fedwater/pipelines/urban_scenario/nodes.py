@@ -33,6 +33,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from fedwater.networks.partition import auto_seed_node, district_nodes
+
 SECONDS_PER_DAY = 86400
 ANCHOR_DAYS_PER_MONTH = 30  # anchors are monthly volumes on a 30-day basis
 
@@ -198,12 +200,19 @@ def build_portfolios(wn, districts: dict, landuse_factors: pd.DataFrame,
     and reported by ``sim_validation``; nothing raises here.
     """
     level = landuse_factors.set_index(["income", "land_use"])["level_factor"].to_dict()
-    mapping = dict(zip(districts["districts"].keys(),
-                       scenario["income_landuse_mapping"]))
+    names = list(district_nodes(districts))
+    codes = scenario["income_landuse_mapping"]
+    if len(codes) != len(names):
+        raise ValueError(
+            f"income_landuse_mapping has {len(codes)} entries for "
+            f"{len(names)} districts {names}. The consumption map is POSITIONAL "
+            "and therefore network-specific: a map written for one network "
+            "means something different on another.")
+    mapping = dict(zip(names, codes))
     anchor_scale = float(hydraulics["anchor_scale"])
 
     rows = []
-    for district, nodes in districts["districts"].items():
+    for district, nodes in district_nodes(districts).items():
         income, land_use_code = mapping[district]
         for node in nodes:
             base_si = wn.get_node(node).demand_timeseries_list[0].base_value  # m3/s
@@ -256,10 +265,18 @@ def build_drift_schedule(wn, districts: dict, scenario: dict,
 
     rng = np.random.default_rng(seed)
     district = drift["tgt_district"]
-    nodes = set(districts["districts"][district])
+    nodes = set(district_nodes(districts)[district])
 
     G = wn.to_graph().to_undirected().subgraph(nodes)
-    seed_node = str(drift["seed_node"])
+    # A null seed node means auto-pick: the district's largest-base-demand
+    # junction, skipping zero-demand trunk nodes. Same rule the experiments
+    # engine has always applied when a study retargets the drift district --
+    # it lives in networks.partition now so a plain `kedro run` and the engine
+    # cannot disagree. The diffusion itself is untouched.
+    if drift.get("seed_node") in (None, "", "None"):
+        seed_node = auto_seed_node(wn, districts, district)
+    else:
+        seed_node = str(drift["seed_node"])
     if seed_node not in nodes:
         raise ValueError(f"seed_node {seed_node} not in {district}")
 

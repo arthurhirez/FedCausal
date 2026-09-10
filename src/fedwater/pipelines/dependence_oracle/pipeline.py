@@ -13,7 +13,7 @@ def create_pipeline(**kwargs) -> Pipeline:
         [
             node(
                 topology_features,
-                inputs=["wn_variant", "districts", "gt_boundaries", "params:sensors"],
+                inputs=["wn_variant", "districts", "gt_boundaries", "network_profile"],
                 outputs="gt_topology",
                 name="topology_features",
             ),

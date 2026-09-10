@@ -28,6 +28,8 @@ import zlib
 import numpy as np
 import pandas as pd
 
+from fedwater.networks.partition import district_nodes
+
 from . import methods as M
 
 
@@ -64,8 +66,10 @@ def district_signals(sensor_series: pd.DataFrame, steps_day: int,
 # topology (unchanged behaviour)
 # --------------------------------------------------------------------------
 def topology_features(wn, districts: dict, gt_boundaries: pd.DataFrame,
-                      sensors: dict) -> pd.DataFrame:
+                      network_profile: dict) -> pd.DataFrame:
     import networkx as nx
+
+    sensors = network_profile["sensors"]
 
     closed = set(gt_boundaries.loc[gt_boundaries["closed"], "pipe"])
     G = nx.Graph()
@@ -75,7 +79,7 @@ def topology_features(wn, districts: dict, gt_boundaries: pd.DataFrame,
             G.add_edge(pipe.start_node_name, pipe.end_node_name,
                        weight=pipe.length)
 
-    names = list(districts["districts"].keys())
+    names = list(district_nodes(districts))
     rows = []
     for i, da in enumerate(names):
         for db in names[i + 1:]:

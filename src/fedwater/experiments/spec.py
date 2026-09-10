@@ -24,6 +24,17 @@ disambiguated by position (medium income vs mixed land use). The shipped
 scenario is ``LR_LM_LC_LR_LR``: all incomes low, land use
 residential / mixed / commercial / residential / residential.
 
+NETWORK AXIS: ``network`` names a bundle under ``data/01_raw/`` and is part of
+the world identity, so a world hash cannot be reused across networks. It is
+NOT a parameter override -- it is written to ``conf/local/globals.yml``, which
+is what the catalog interpolates. Adding it changes every existing world hash;
+``data/09_experiments/worlds/`` must be re-simulated.
+
+The consumption map is POSITIONAL over districts in name order, so a map
+written for one network means something different on another. The district
+count is now read from the selected bundle's ``districts.yml`` and validated
+rather than assumed to be 5.
+
 LAND-USE REFACTOR: this module previously encoded a density axis, with both
 token positions drawn from {L, M, H}. Every consumption map and every drift
 target changed, so every world hash changed — ``data/09_experiments/worlds/``
@@ -39,6 +50,8 @@ import re
 from pathlib import Path
 
 import yaml
+
+from fedwater.networks.partition import district_nodes
 
 # Income initials and land-use initials are SEPARATE alphabets. 'M' means
 # medium income in position 0 and mixed land use in position 1 — position
@@ -69,7 +82,7 @@ DEFAULT_PIPELINES = ("fl", "dependence_detection", "drift_attribution")
 # --------------------------------------------------------------------------
 # consumption-map codec
 # --------------------------------------------------------------------------
-def decode_map(code: str, n_districts: int = 5) -> list[list[str]]:
+def decode_map(code: str, n_districts: int) -> list[list[str]]:
     """``'LR_LM_LC_LR_LR' -> [['low','residential'], ['low','mixed'], ...]``."""
     tokens = code.strip().upper().split("_")
     if len(tokens) != n_districts:
@@ -92,6 +105,47 @@ def decode_map(code: str, n_districts: int = 5) -> list[list[str]]:
 def encode_map(mapping: list) -> str:
     """Inverse of :func:`decode_map` (accepts lists or tuples)."""
     return "_".join(_INCOME_INV[i] + _LAND_USE_INV[lu] for i, lu in mapping)
+
+
+# --------------------------------------------------------------------------
+# network bundles
+# --------------------------------------------------------------------------
+def default_network(project_root: Path) -> str:
+    """The active network, resolved the way Kedro resolves it.
+
+    ``conf/local/globals.yml`` merges OVER ``conf/base/globals.yml`` -- that is
+    how the catalog picks its bundle, so spec expansion must read it the same
+    way. Reading base alone let the engine hash and build a world as one
+    network while a plain ``kedro run`` in the same project used another.
+    """
+    network = None
+    for env in ("base", "local"):
+        path = Path(project_root) / "conf" / env / "globals.yml"
+        if path.exists():
+            network = (yaml.safe_load(path.read_text()) or {}).get(
+                "network", network)
+    if network is None:
+        raise FileNotFoundError(
+            f"No `network` key found in {project_root}/conf/base/globals.yml "
+            "(or conf/local/globals.yml). It names a bundle directory under "
+            "data/01_raw/.")
+    return network
+
+
+def bundle(project_root: Path, network: str) -> dict:
+    """Paths and contents of one network bundle under ``data/01_raw/``."""
+    root = Path(project_root) / "data/01_raw" / network
+    inp = root / "network.inp"
+    districts_path = root / "districts.yml"
+    profile_path = root / "profile.yml"
+    for path in (inp, districts_path, profile_path):
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Network bundle '{network}' is incomplete: {path} is missing. "
+                f"A bundle needs network.inp, districts.yml and profile.yml.")
+    return {"network": network, "inp": inp,
+            "districts": yaml.safe_load(districts_path.read_text()),
+            "profile": yaml.safe_load(profile_path.read_text())}
 
 
 # --------------------------------------------------------------------------
@@ -171,7 +225,8 @@ def expand_axes(section) -> list[dict]:
 # --------------------------------------------------------------------------
 # resolution — spec + base params -> full-block override + effective config
 # --------------------------------------------------------------------------
-def resolve_world(world: dict, base_params: dict) -> dict:
+def resolve_world(world: dict, base_params: dict, network: str,
+                  n_districts: int) -> dict:
     """Build the FULL top-level parameter blocks a world writes to
     ``conf/local`` (Kedro merges destructively at the top level — partial
     blocks silently erase sibling keys, the documented gotcha), plus the
@@ -188,7 +243,8 @@ def resolve_world(world: dict, base_params: dict) -> dict:
     n_months = int(world.get("n_months", base["time"]["n_months"]))
     scenario["n_months"] = n_months
     if "consumption_map" in world:
-        scenario["income_landuse_mapping"] = decode_map(world["consumption_map"])
+        scenario["income_landuse_mapping"] = decode_map(
+            world["consumption_map"], n_districts)
     if "beta" in world:
         scenario["beta"] = float(world["beta"])
     drift_patch = world.get("drift", {}) or {}
@@ -222,7 +278,13 @@ def resolve_world(world: dict, base_params: dict) -> dict:
 
     effective = {k: v for k, v in base.items() if k != "fl"}
     effective = {**effective, **override}
+    # The network is part of the world's identity but NOT of its parameter
+    # override: it reaches the catalog through conf/local/globals.yml. Putting
+    # it in `effective` is what stops a Graeme world being reused under a
+    # D-Town label.
+    effective["network"] = network
     flat = {
+        "network": network,
         "sim_seed": override["seed"],
         "n_months": n_months,
         "variant": override["coupling"]["variant"],
@@ -236,7 +298,8 @@ def resolve_world(world: dict, base_params: dict) -> dict:
         "drift_to_land_use": scenario["drift"]["to_land_use"],
     }
     return {"sim_hash": canonical_hash(effective), "override": override,
-            "effective": effective, "flat": flat}
+            "effective": effective, "flat": flat, "network": network,
+            "globals": {"network": network}}
 
 
 def resolve_run(run: dict, base_params: dict,
@@ -275,7 +338,8 @@ def validate_world(resolved: dict, districts: dict) -> None:
     enough, both is fine, neither is a no-op drift and is rejected.
     """
     eff, flat = resolved["effective"], resolved["flat"]
-    names = list(districts["districts"])
+    names = list(district_nodes(districts))
+    net = resolved.get("network", "?")
     if flat["variant"] not in COUPLING_VARIANTS:
         raise ValueError(f"coupling.variant '{flat['variant']}' not in "
                          f"{COUPLING_VARIANTS}.")
@@ -286,11 +350,20 @@ def validate_world(resolved: dict, districts: dict) -> None:
                          "(0 = shape-only, 1 = full level effect).")
     tgt = flat["drift_district"]
     if tgt not in names:
-        raise ValueError(f"drift.tgt_district '{tgt}' not one of {names}.")
+        raise ValueError(
+            f"[network={net}] drift.tgt_district '{tgt}' not one of {names}.")
     seed_node = flat["drift_seed_node"]
-    if seed_node is not None and str(seed_node) not in [
-            str(n) for n in districts["districts"][tgt]]:
-        raise ValueError(f"drift.seed_node '{seed_node}' is not a node of {tgt}.")
+    tgt_nodes = district_nodes(districts)[tgt]
+    if seed_node is not None and str(seed_node) not in tgt_nodes:
+        raise ValueError(
+            f"[network={net}] drift.seed_node '{seed_node}' is not a node of "
+            f"{tgt}, whose junctions look like {tgt_nodes[:5]}... "
+            f"({len(tgt_nodes)} total).\n"
+            "A seed node id is NETWORK-SPECIFIC. Either drop `seed_node` from "
+            "the study and let the auto-picker choose per network (the "
+            "district's largest-base-demand junction), or pin the study to the "
+            "network the id belongs to with `network: <name>` under "
+            "worlds.fixed.")
 
     land_use_codes = set(eff["land_use"]["mix"])
     if flat["drift_to_land_use"] not in land_use_codes:
@@ -353,9 +426,15 @@ def with_beta(resolved: dict, beta: float) -> dict:
 def auto_seed_node(district: str, districts: dict, inp_path: Path) -> str:
     """Deterministic drift seed for a district: its junction with the largest
     base demand in the ``.inp``. Skips zero-demand trunk junctions (the
-    node-110 class of bug the label factory exposed)."""
+    node-110 class of bug the label factory exposed).
+
+    The rule itself lives in ``fedwater.networks.partition`` and is shared with
+    ``build_drift_schedule``, so the engine and a plain ``kedro run`` cannot
+    pick different seeds. This wrapper reads base demands straight out of the
+    ``.inp`` text so spec expansion stays free of a wntr load.
+    """
     demands = _inp_base_demands(Path(inp_path))
-    nodes = [str(n) for n in districts["districts"][district]]
+    nodes = district_nodes(districts)[district]
     carrying = {n: demands.get(n, 0.0) for n in nodes if demands.get(n, 0.0) > 0}
     if not carrying:
         raise ValueError(f"No demand-carrying junction found in {district}.")
@@ -397,7 +476,14 @@ def load_studies(project_root: Path) -> dict:
 
 
 def expand_study(name: str, project_root: Path) -> dict:
-    """Resolve one named study into validated world specs x run specs."""
+    """Resolve one named study into validated world specs x run specs.
+
+    ``network`` is an ordinary world axis: put it under ``worlds.fixed`` or
+    ``worlds.grid`` to sweep it. When absent it falls back to
+    ``conf/base/globals.yml``. Each world carries its own bundle, so a study
+    MAY mix networks -- though a positional ``consumption_map`` is only
+    comparable across networks with the same district count and ordering.
+    """
     project_root = Path(project_root)
     cfg = load_studies(project_root)
     if name not in cfg.get("studies", {}):
@@ -405,19 +491,28 @@ def expand_study(name: str, project_root: Path) -> dict:
                        f"{sorted(cfg.get('studies', {}))}.")
     study = cfg["studies"][name]
     base = yaml.safe_load((project_root / "conf/base/parameters.yml").read_text())
-    districts = yaml.safe_load(
-        (project_root / "data/01_raw/districts_graeme.yml").read_text())
-    inp = project_root / "data/01_raw/Graeme.inp"
+    fallback = default_network(project_root)
 
     pipelines = tuple(study.get("pipelines", DEFAULT_PIPELINES))
-    worlds = []
+    worlds, bundles = [], {}
     for w in expand_axes(study.get("worlds")):
-        resolved = resolve_world(w, base)
+        w = copy.deepcopy(w)
+        network = w.pop("network", fallback)
+        if network not in bundles:
+            bundles[network] = bundle(project_root, network)
+        b = bundles[network]
+        districts, inp = b["districts"], b["inp"]
+        n_districts = len(district_nodes(districts))
+
+        resolved = resolve_world(w, base, network, n_districts)
         if resolved["flat"]["drift_seed_node"] is None:
-            node = auto_seed_node(resolved["flat"]["drift_district"],
-                                  districts, inp)
+            # A per-network override in profile.yml wins over the auto-picker.
+            override = (b["profile"].get("drift_seed_nodes") or {}).get(
+                resolved["flat"]["drift_district"])
+            node = override or auto_seed_node(
+                resolved["flat"]["drift_district"], districts, inp)
             w = _deep_merge(w, {"drift": {"seed_node": node}})
-            resolved = resolve_world(w, base)
+            resolved = resolve_world(w, base, network, n_districts)
         validate_world(resolved, districts)
         worlds.append(resolved)
     runs = [resolve_run(r, base, pipelines) for r in expand_axes(study.get("runs"))]
@@ -428,6 +523,7 @@ def expand_study(name: str, project_root: Path) -> dict:
         raise ValueError(f"Study '{name}' contains duplicate run specs.")
     return {"name": name, "worlds": worlds, "runs": runs,
             "pipelines": pipelines,
+            "networks": sorted(bundles),
             "harvest": tuple(study.get("harvest",
                              ("validation", "drift", "ladder", "c4",
                               "dependence"))),

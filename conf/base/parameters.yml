@@ -73,7 +73,11 @@ scenario:
     - [low, industrial]  # District_E
   drift:
     tgt_district: District_D
-    seed_node: "J347" #"2"
+    seed_node: null             # null = auto-pick the district's largest-base-
+                                # demand junction, skipping zero-demand trunk
+                                # nodes. A hardcoded id here is network-specific
+                                # and silently wrong after a network switch;
+                                # per-network overrides go in profile.yml.
     warmup_months: 4            # MUST be >= 1: apply_drift_ramp blends against
                                 # the month BEFORE the switch, so a node
                                 # drifting at month 0 has nothing to blend from.
@@ -226,21 +230,10 @@ patterns:
   #   medium: {morning: [7.0, 2.6], afternoon: [14.0, 1.6], evening: [19.0, 2.0]}
   #   high:   {morning: [7.5, 1.4], afternoon: [14.0, 1.2], evening: [19.5, 1.8]}
 
-sensors:                # 2 pressure nodes + 3 flow links per district (BEPE)
-# # GRAEME
-  # District_A: {pressure: ["64", "75"], flow: ["102", "100", "85"]}
-  # District_B: {pressure: ["79", "86"], flow: ["157", "135", "165"]}
-  # District_C: {pressure: ["74", "58"], flow: ["110", "119", "91"]}
-  # District_D: {pressure: ["31", "26"], flow: ["38", "96", "69"]}
-  # District_E: {pressure: ["41", "12"], flow: ["59", "11", "19"]}
-
-# D-Town
-  District_A: {pressure: ["J497", "J32"], flow: ["P349", "P1036", "P958"]}
-  District_B: {pressure: ["J67", "J87"], flow: ["P1044", "P245", "P842"]}
-  District_C: {pressure: ["J1208", "J83"], flow: ["P141", "P53", "P752"]}
-  District_D: {pressure: ["J238", "J176"], flow: ["P763", "P787", "P376"]}
-  District_E: {pressure: ["J337", "J411"], flow: ["P13", "P22", "P19"]}
-
+# NOTE: `sensors` moved to data/01_raw/<network>/profile.yml. Sensor placement
+# is a property of the NETWORK, not of the scenario, and keeping it here meant
+# switching networks by commenting blocks in and out -- which is exactly the
+# kind of change that fails silently.
 
 noise:                  # instrumentation layer (separate from behaviour)
   pressure_sigma: 0.10          # mca
@@ -370,3 +363,30 @@ fl:                         # ---- federated learning over the client CSVs ----
                             # period).
     k_sigma: 3.0
     persistence: 2
+
+# --------------------------------------------------------------- assessment --
+# Pre-flight over the selected network. Run with `kedro run --pipeline
+# assessment`; not part of __default__. Nothing here affects a simulation --
+# these are the settings of the REPORT, not of the world.
+assessment:
+  pressure_floor_m: 15.0        # ABNT NBR 12218 residential minimum
+  conditioning:
+    duration_h: 24.0            # "can this network run at all", one day
+    timestep_s: 3600
+    normalize_pattern_length: 24  # the KY files ship 23-step diurnal patterns;
+                                  # EPANET wraps them, so the cycle walks
+                                  # backwards one hour per day
+    inpfile_units: LPS          # units of any .inp written back out
+    expected_headloss: H-W      # ASSERTED, never coerced: silently switching a
+                                # network to D-W changes every pipe's friction
+    storage_ladder: [as_is, synth_controls, freeze_tanks]
+                                # increasing intrusiveness; first policy that
+                                # yields a usable model wins, rejects are logged
+  capacity:
+    lambda_grid: [0.05, 0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 5.0]
+    tank_levels: [initial, min] # the storage-dependence of the answer: a NaN at
+                                # `min` means the headroom at `initial` is
+                                # borrowed from storage, not supplied by pipes
+    modes: [DD, PDD]            # DD locates the limit (pressure cliff);
+                                # PDD characterises the approach (unserved demand)
+    bisect_tol: 0.02

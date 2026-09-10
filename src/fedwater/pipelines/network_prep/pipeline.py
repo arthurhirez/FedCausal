@@ -1,6 +1,8 @@
 from kedro.pipeline import Pipeline, node
 
-from .nodes import apply_coupling, configure_network, validate_partition
+from fedwater.networks.partition import validate_partition
+
+from .nodes import apply_coupling, configure_network
 
 
 def create_pipeline(**kwargs) -> Pipeline:
@@ -8,7 +10,7 @@ def create_pipeline(**kwargs) -> Pipeline:
         [
             node(
                 configure_network,
-                inputs=["graeme_network", "params:hydraulics", "params:time"],
+                inputs=["network_inp", "params:hydraulics", "params:time"],
                 outputs="wn_configured",
                 name="configure_network",
             ),
