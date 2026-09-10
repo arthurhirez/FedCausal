@@ -1,0 +1,309 @@
+diff --git a/conf/base/catalog.yml b/conf/base/catalog.yml
+index fe18d37..9f149da 100644
+--- a/conf/base/catalog.yml
++++ b/conf/base/catalog.yml
+@@ -3,7 +3,10 @@
+ # to evaluate methods, never to train them.
+ # =========================================================================
+ 
+-graeme_network:
++# 'network'/'districts' are generic on purpose: conf/<env>/catalog.yml
++# repoints them at a different .inp/.yml pair per network (see conf/dtown/).
++# conf/base is Graeme's own environment, so its default IS Graeme.
++network:
+   type: fedwater.datasets.WntrNetworkDataset
+   filepath: data/01_raw/Graeme.inp
+ 
+diff --git a/conf/base/parameters.yml b/conf/base/parameters.yml
+index 16308dc..50cadef 100644
+--- a/conf/base/parameters.yml
++++ b/conf/base/parameters.yml
+@@ -18,6 +18,16 @@ hydraulics:
+                         # 13-31 mca. 0.06 already goes negative at worst case.
+   demand_multiplier: 1.0  # pins EPANET's global multiplier (inp had 0.2!)
+   demand_model: DD        # demand-driven; PDD available for stress studies
++  # Solver convergence — pinned for the same reason as demand_multiplier: an
++  # .inp file's own [OPTIONS] section must never silently decide this. Loose
++  # ACCURACY + UNBALANCED CONTINUE lets EPANET accept and report an
++  # unbalanced solution with no error; measured up to 0.27 L/s per-node
++  # residual (~18% of a node's demand) on a network shipped at 0.01. See
++  # configure_network's docstring for the measurement this default rests on.
++  accuracy: 0.00001        # EPANET's own default is 0.001; this is 100x tighter
++  trials: 500
++  unbalanced: CONTINUE     # a hard STOP would abort the whole horizon on one step
++  unbalanced_trials: 10
+ 
+ coupling:               # the dependence dial
+   variant: baseline     # baseline | partial | isolated
+diff --git a/conf/dtown/catalog.yml b/conf/dtown/catalog.yml
+new file mode 100644
+index 0000000..4d573dd
+--- /dev/null
++++ b/conf/dtown/catalog.yml
+@@ -0,0 +1,10 @@
++# D-Town environment: repoints the two raw inputs; everything else inherits
++# conf/base/catalog.yml unchanged (Kedro merges catalog.yml per top-level
++# key across environments, so only entries that differ need to be listed).
++network:
++  type: fedwater.datasets.WntrNetworkDataset
++  filepath: data/01_raw/Dtown.inp
++
++districts:
++  type: kedro_datasets.yaml.YAMLDataset
++  filepath: data/01_raw/districts_dtown.yml
+diff --git a/src/fedwater/pipelines/dependence_detection/nodes.py b/src/fedwater/pipelines/dependence_detection/nodes.py
+index 9f7e0c0..357583a 100644
+--- a/src/fedwater/pipelines/dependence_detection/nodes.py
++++ b/src/fedwater/pipelines/dependence_detection/nodes.py
+@@ -36,6 +36,7 @@ import numpy as np
+ import pandas as pd
+ 
+ from fedwater.pipelines.dependence_oracle import methods as M
++from fedwater.utils import stable_hash
+ 
+ from . import fed_methods as F
+ 
+@@ -91,7 +92,7 @@ def federated_dependence(latents_resid: pd.DataFrame,
+             for b in clients[i + 1:]:
+                 X, Y = mats[a], mats[b]
+                 Z = np.hstack([mats[c] for c in clients if c not in (a, b)])
+-                rng = np.random.default_rng([seed, hash((a, b, kind)) % 2**31])
++                rng = np.random.default_rng([seed, stable_hash((a, b, kind))])
+                 base = dict(level="T", kind=kind, district_a=a, district_b=b,
+                             comm_floats_per_client=cost_t)
+ 
+@@ -129,7 +130,7 @@ def federated_dependence(latents_resid: pd.DataFrame,
+     cost_p = n_rounds * (n_p + 1) * d_p          # what FPL already sends
+     for i, a in enumerate(clients):
+         for b in clients[i + 1:]:
+-            rng = np.random.default_rng([seed, 99, hash((a, b)) % 2**31])
++            rng = np.random.default_rng([seed, 99, stable_hash((a, b))])
+             base = dict(level="P", kind="prototype_displacement",
+                         district_a=a, district_b=b,
+                         comm_floats_per_client=cost_p)
+diff --git a/src/fedwater/pipelines/dependence_oracle/nodes.py b/src/fedwater/pipelines/dependence_oracle/nodes.py
+index a94ad82..43aa04a 100644
+--- a/src/fedwater/pipelines/dependence_oracle/nodes.py
++++ b/src/fedwater/pipelines/dependence_oracle/nodes.py
+@@ -26,6 +26,8 @@ from __future__ import annotations
+ import numpy as np
+ import pandas as pd
+ 
++from fedwater.utils import stable_hash
++
+ from . import methods as M
+ 
+ 
+@@ -199,7 +201,7 @@ def dependence_battery(sensor_series: pd.DataFrame,
+         for i, da in enumerate(keys):
+             for db in keys[i + 1:]:
+                 a, b = sig[da], sig[db]
+-                rng = np.random.default_rng([seed, hash((da, db, kind)) % 2**31])
++                rng = np.random.default_rng([seed, stable_hash((da, db, kind))])
+                 base = dict(kind=kind, district_a=da, district_b=db)
+ 
+                 if 1 in tiers:
+@@ -265,7 +267,7 @@ def dependence_battery(sensor_series: pd.DataFrame,
+                         continue
+                     X, Y = mats[da], mats[db]
+                     rng = np.random.default_rng(
+-                        [seed, 4, hash((da, db, kind)) % 2**31])
++                        [seed, 4, stable_hash((da, db, kind))])
+                     base = dict(kind=kind, district_a=da, district_b=db)
+ 
+                     s, p = _roll_matrix_pvalue(M.rv_coefficient, X, Y,
+diff --git a/src/fedwater/pipelines/network_prep/nodes.py b/src/fedwater/pipelines/network_prep/nodes.py
+index 344e219..1a44b42 100644
+--- a/src/fedwater/pipelines/network_prep/nodes.py
++++ b/src/fedwater/pipelines/network_prep/nodes.py
+@@ -15,13 +15,34 @@ def configure_network(wn, hydraulics: dict, time: dict):
+     """Set *explicit* hydraulic and time options.
+ 
+     Rationale: Graeme.inp carries a hidden global ``Demand Multiplier = 0.2``.
+-    Every option that affects physics is pinned here, from parameters, so the
+-    simulation never depends on silent defaults baked into the input file.
++    Every option that affects physics — including solver convergence, not
++    only demand — is pinned here, from parameters, so the simulation never
++    depends on silent defaults baked into the input file.
+     """
+     wn = copy.deepcopy(wn)
+     wn.options.hydraulic.demand_multiplier = float(hydraulics["demand_multiplier"])
+     wn.options.hydraulic.demand_model = hydraulics["demand_model"]  # 'DD' or 'PDD'
+ 
++    # Solver convergence, pinned for the same reason as demand_multiplier
++    # above: without this, EPANET keeps whatever the .inp file's own
++    # [OPTIONS] section happened to set, and 'UNBALANCED CONTINUE' lets
++    # EPANET accept a solution that does not satisfy the nodal mass balance
++    # at a given step and report it with NO error or warning surfaced to
++    # wntr. Measured on a network run at ACCURACY 0.01 (a value some .inp
++    # files ship with): a per-node demand residual up to 0.27 L/s at loaded
++    # steps — about 18% of a node's own demand, spatially clustered, and
++    # indistinguishable from signal to any dependence estimator reading the
++    # delivered-demand series. Tightening to 1e-5 removed it (residual down
++    # to ~9e-5 L/s, the single-precision floor of EPANET's own binary
++    # output) at roughly one extra second over a multi-month solve.
++    # UNBALANCED stays CONTINUE — a hard STOP would abort the entire horizon
++    # on one difficult step — but ACCURACY and TRIALS must never again be
++    # silently inherited.
++    wn.options.hydraulic.accuracy = float(hydraulics["accuracy"])
++    wn.options.hydraulic.trials = int(hydraulics["trials"])
++    wn.options.hydraulic.unbalanced = hydraulics["unbalanced"]
++    wn.options.hydraulic.unbalanced_value = int(hydraulics["unbalanced_trials"])
++
+     horizon_h = int(time["n_months"] * time["days_per_month"] * 24)
+     step_s = int(time["resolution_h"] * 3600)
+     wn.options.time.duration = horizon_h * 3600
+@@ -32,31 +53,69 @@ def configure_network(wn, hydraulics: dict, time: dict):
+ 
+ 
+ def validate_partition(wn, districts: dict) -> pd.DataFrame:
+-    """Hard sanity: districts must exactly partition the junction set.
+-
+-    Raises on overlap / missing / unknown nodes; returns a coverage report.
++    """Hard sanity: districts must exactly partition the *junction* set.
++
++    Tanks and reservoirs are allowed as members but are not required and do
++    not count toward the partition — a network with storage (D-Town: 1
++    reservoir + 7 tanks) legitimately lists them in its district yml so that
++    downstream code (drift diffusion, boundary detection) can place them, but
++    they carry no demand and are not what "exactly partition" is checked
++    against. Only unknown node IDs (neither a junction, tank, nor reservoir)
++    are rejected outright.
++
++    Also checks that every district is internally connected using the FULL
++    node set (junctions and any storage members together) — not the consumer
++    junctions alone. Consumer-only connectivity is the wrong graph to check:
++    on D-Town, District_A's zero-demand junctions are the articulation points
++    holding its 93 consumers together, and a consumer-only walk fragments it
++    into 31 + 62 unreachable nodes. Internal disconnection isn't fatal here —
++    it only degrades a node-level diffusion drift to switching in fallback
++    order — so it is reported, not raised.
++
++    Raises on overlap / missing / unknown junctions; returns a coverage
++    report with a connectivity column per district.
+     """
++    import networkx as nx
++
+     districts = districts["districts"]
+     all_junctions = set(wn.junction_name_list)
++    storage = set(wn.tank_name_list) | set(wn.reservoir_name_list)
+ 
+-    seen: set[str] = set()
++    seen_junctions: set[str] = set()
+     overlaps: set[str] = set()
++    unknown: set[str] = set()
+     for nodes in districts.values():
+-        dup = seen & set(nodes)
++        j = set(nodes) & all_junctions
++        dup = seen_junctions & j
+         overlaps |= dup
+-        seen |= set(nodes)
++        seen_junctions |= j
++        unknown |= set(nodes) - all_junctions - storage
+ 
+-    missing = all_junctions - seen
+-    unknown = seen - all_junctions
++    missing = all_junctions - seen_junctions
+     if overlaps or missing or unknown:
+         raise ValueError(
+             f"District partition invalid — overlaps={sorted(overlaps)}, "
+             f"missing={sorted(missing)}, unknown={sorted(unknown)}"
+         )
+ 
+-    report = pd.DataFrame(
+-        [{"district": d, "n_nodes": len(n)} for d, n in districts.items()]
+-    )
++    G = nx.Graph()
++    for name in wn.link_name_list:
++        link = wn.get_link(name)
++        G.add_edge(link.start_node_name, link.end_node_name)
++
++    rows = []
++    for d, nodes in districts.items():
++        node_set = set(nodes)
++        sub = G.subgraph(node_set & set(G.nodes))
++        n_components = nx.number_connected_components(sub) if len(sub) else 0
++        rows.append({
++            "district": d,
++            "n_nodes": len(node_set & all_junctions),
++            "n_storage": len(node_set & storage),
++            "connected": bool(n_components <= 1),
++            "n_components": n_components,
++        })
++    report = pd.DataFrame(rows)
+     report["total_nodes"] = len(all_junctions)
+     return report
+ 
+diff --git a/src/fedwater/pipelines/network_prep/pipeline.py b/src/fedwater/pipelines/network_prep/pipeline.py
+index 92915d5..588bd89 100644
+--- a/src/fedwater/pipelines/network_prep/pipeline.py
++++ b/src/fedwater/pipelines/network_prep/pipeline.py
+@@ -8,7 +8,7 @@ def create_pipeline(**kwargs) -> Pipeline:
+         [
+             node(
+                 configure_network,
+-                inputs=["graeme_network", "params:hydraulics", "params:time"],
++                inputs=["network", "params:hydraulics", "params:time"],
+                 outputs="wn_configured",
+                 name="configure_network",
+             ),
+diff --git a/src/fedwater/pipelines/sensing/nodes.py b/src/fedwater/pipelines/sensing/nodes.py
+index 71d3783..962d5d0 100644
+--- a/src/fedwater/pipelines/sensing/nodes.py
++++ b/src/fedwater/pipelines/sensing/nodes.py
+@@ -10,6 +10,8 @@ from __future__ import annotations
+ import numpy as np
+ import pandas as pd
+ 
++from fedwater.utils import stable_hash
++
+ 
+ def extract_sensor_series(pressures: pd.DataFrame, flows: pd.DataFrame,
+                           sensors: dict) -> pd.DataFrame:
+@@ -37,7 +39,7 @@ def add_measurement_noise(sensor_series: pd.DataFrame, noise: dict,
+     df = sensor_series.copy()
+     observed = np.empty(len(df))
+     for (sensor, kind), grp in df.groupby(["sensor", "kind"]):
+-        rng = np.random.default_rng([seed, hash(sensor) % 2**31])
++        rng = np.random.default_rng([seed, stable_hash(sensor)])
+         sigma = noise[f"{kind}_sigma"]
+         q = noise[f"{kind}_quantization"]
+         vals = grp["value"].to_numpy() + rng.normal(0.0, sigma, len(grp))
+diff --git a/src/fedwater/utils.py b/src/fedwater/utils.py
+new file mode 100644
+index 0000000..d3be846
+--- /dev/null
++++ b/src/fedwater/utils.py
+@@ -0,0 +1,32 @@
++"""Small shared utilities.
++
++``stable_hash`` exists because Python salts ``str``/``tuple`` hashing per
++process (PEP 456) unless ``PYTHONHASHSEED`` is fixed in the environment.
++Seeding a ``numpy`` RNG with the builtin ``hash()`` of a sensor name or a
++district pair therefore makes that RNG's stream depend on process start-up
++noise, not on ``seed`` — the same call with the same ``seed`` silently
++produces a different stream on every run.
++
++Measured impact before this was fixed: three runs of
++``sensing.add_measurement_noise(seed=42)`` on identical input gave observed
++value sums of 856968.38 / 856991.23 / 856983.29. That breaks the "same seed,
++same dataset, bit for bit" invariant, and does so silently — there is no
++error, only a different number each time.
++"""
++from __future__ import annotations
++
++import zlib
++
++
++def stable_hash(obj) -> int:
++    """A reproducible, non-negative hash in ``[0, 2**31)``.
++
++    Uses ``repr(obj)`` rather than ``obj`` itself: for the ``str`` and
++    ``tuple``-of-``str`` keys this is used with (sensor names, district-pair
++    tuples), ``repr`` is a stable, process-independent string, so the crc32
++    of its UTF-8 encoding is stable across processes and across machines —
++    exactly the property ``hash()`` does not have. Callers that previously
++    wrote ``hash(x) % 2**31`` should call ``stable_hash(x)`` directly; the
++    modulus is already applied here.
++    """
++    return zlib.crc32(repr(obj).encode()) % 2**31

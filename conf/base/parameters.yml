@@ -236,7 +236,7 @@ sensors:                # 2 pressure nodes + 3 flow links per district (BEPE)
 
 # D-Town
   District_A: {pressure: ["J497", "J32"], flow: ["P349", "P1036", "P958"]}
-  District_B: {pressure: ["J67", "J87"], flow: ["P1044", "P425", "P842"]}
+  District_B: {pressure: ["J67", "J87"], flow: ["P1044", "P245", "P842"]}
   District_C: {pressure: ["J1208", "J83"], flow: ["P141", "P53", "P752"]}
   District_D: {pressure: ["J238", "J176"], flow: ["P763", "P787", "P376"]}
   District_E: {pressure: ["J337", "J411"], flow: ["P13", "P22", "P19"]}
