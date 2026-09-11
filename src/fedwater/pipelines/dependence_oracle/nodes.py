@@ -23,11 +23,10 @@ correlation (all clients share the weather).
 """
 from __future__ import annotations
 
-import zlib
-
 import numpy as np
 import pandas as pd
 
+from fedwater.hashing import stable_hash
 from fedwater.networks.partition import district_nodes
 
 from . import methods as M
@@ -206,7 +205,7 @@ def dependence_battery(sensor_series: pd.DataFrame,
             for db in keys[i + 1:]:
                 a, b = sig[da], sig[db]
                 rng = np.random.default_rng(
-                    [seed, zlib.crc32(f"{da}|{db}|{kind}".encode())])
+                    [seed, stable_hash((da, db, kind))])
                 base = dict(kind=kind, district_a=da, district_b=db)
 
                 if 1 in tiers:
@@ -272,7 +271,7 @@ def dependence_battery(sensor_series: pd.DataFrame,
                         continue
                     X, Y = mats[da], mats[db]
                     rng = np.random.default_rng(
-                        [seed, 4, zlib.crc32(f"{da}|{db}|{kind}".encode())])
+                        [seed, 4, stable_hash((da, db, kind))])
                     base = dict(kind=kind, district_a=da, district_b=db)
 
                     s, p = _roll_matrix_pvalue(M.rv_coefficient, X, Y,

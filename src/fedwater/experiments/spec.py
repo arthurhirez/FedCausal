@@ -51,6 +51,7 @@ from pathlib import Path
 
 import yaml
 
+from fedwater.networks import profile as nprofile
 from fedwater.networks.partition import district_nodes
 
 # Income initials and land-use initials are SEPARATE alphabets. 'M' means
@@ -226,11 +227,22 @@ def expand_axes(section) -> list[dict]:
 # resolution — spec + base params -> full-block override + effective config
 # --------------------------------------------------------------------------
 def resolve_world(world: dict, base_params: dict, network: str,
-                  n_districts: int) -> dict:
+                  n_districts: int, profile: dict | None = None) -> dict:
     """Build the FULL top-level parameter blocks a world writes to
     ``conf/local`` (Kedro merges destructively at the top level — partial
     blocks silently erase sibling keys, the documented gotcha), plus the
     effective sim configuration and its content hash.
+
+    NETWORK-SCOPED PARAMETERS are resolved FIRST, from the bundle's
+    ``profile.yml``, before anything else reads ``base_params``. Keys such as
+    ``hydraulics.anchor_scale`` and ``scenario.income_landuse_mapping`` are
+    ``null`` in ``conf/base/parameters.yml`` precisely because their correct
+    value is a fact about the network; filling them here is what puts the
+    resolved value into ``effective`` and therefore into the world's content
+    hash, so editing a profile correctly invalidates that network's worlds.
+    ``networks.profile.resolve_params`` only ever fills nulls, so a study that
+    sets one of those keys explicitly still wins, and applying it again inside
+    a plain ``kedro run`` changes nothing.
 
     Note on ``land_use``: the sector table, intensities and mixes live in a
     base-only block and are NOT part of the override, exactly like
@@ -238,7 +250,7 @@ def resolve_world(world: dict, base_params: dict, network: str,
     ``effective``, so editing them invalidates caches correctly; a study that
     wants to sweep them goes through ``sim_overrides``.
     """
-    base = base_params
+    base, _ = nprofile.resolve_params(base_params, profile or {})
     scenario = copy.deepcopy(base["scenario"])
     n_months = int(world.get("n_months", base["time"]["n_months"]))
     scenario["n_months"] = n_months
@@ -283,6 +295,18 @@ def resolve_world(world: dict, base_params: dict, network: str,
     # it in `effective` is what stops a Graeme world being reused under a
     # D-Town label.
     effective["network"] = network
+    # SENSOR PLACEMENT, the same gap network_params closed for anchor_scale
+    # et al. `extract_sensor_series` reads `network_profile["sensors"]`
+    # straight from the bundle at kedro-run time, which is correct for the
+    # simulation itself -- but resolve_world never touched it, so it was
+    # invisible to BOTH consequences of not being in `effective`: the world's
+    # content hash did not change if `profile.yml`'s sensors changed (a world
+    # simulated under an old placement would be served from cache under a
+    # NEW one, silently), and the manifest -- which dumps `effective`
+    # verbatim -- had nothing to show. Folding it in here fixes both with the
+    # one change; see PROVENANCE below for why the study index still won't
+    # show it.
+    effective["sensors"] = copy.deepcopy((profile or {}).get("sensors") or {})
     flat = {
         "network": network,
         "sim_seed": override["seed"],
@@ -296,6 +320,18 @@ def resolve_world(world: dict, base_params: dict, network: str,
         "drift_seed_node": scenario["drift"].get("seed_node"),
         "drift_to_income": scenario["drift"]["to_income"],
         "drift_to_land_use": scenario["drift"]["to_land_use"],
+        # PROVENANCE, not identity: `flat` becomes a column of runs.parquet
+        # (engine.collect flattens `manifest["world"]`, which IS `flat`), and
+        # that table is one row per run, so every entry here must be a
+        # scalar. The full per-district sensor lists live in `effective`
+        # (and therefore in each world's manifest.json in full) because a
+        # nested dict cannot be a column; this is the count, to make a
+        # placement change at least VISIBLE in the flat index without
+        # breaking it.
+        "n_pressure_sensors": sum(len(c.get("pressure", []))
+                                  for c in effective["sensors"].values()),
+        "n_flow_sensors": sum(len(c.get("flow", []))
+                              for c in effective["sensors"].values()),
     }
     return {"sim_hash": canonical_hash(effective), "override": override,
             "effective": effective, "flat": flat, "network": network,
@@ -504,15 +540,20 @@ def expand_study(name: str, project_root: Path) -> dict:
         districts, inp = b["districts"], b["inp"]
         n_districts = len(district_nodes(districts))
 
-        resolved = resolve_world(w, base, network, n_districts)
+        resolved = resolve_world(w, base, network, n_districts, b["profile"])
         if resolved["flat"]["drift_seed_node"] is None:
-            # A per-network override in profile.yml wins over the auto-picker.
-            override = (b["profile"].get("drift_seed_nodes") or {}).get(
-                resolved["flat"]["drift_district"])
-            node = override or auto_seed_node(
-                resolved["flat"]["drift_district"], districts, inp)
+            # Precedence (explicit > profile > auto) lives in ONE function,
+            # shared with build_drift_schedule, so the engine and a plain
+            # `kedro run` cannot pick different origins. The auto-picker
+            # passed here is the .inp-TEXT one, which keeps spec expansion
+            # free of a wntr load; it agrees with the model-based picker in
+            # networks.partition on every district of every bundle.
+            tgt = resolved["flat"]["drift_district"]
+            node = nprofile.resolve_seed_node(
+                None, b["profile"], tgt,
+                lambda: auto_seed_node(tgt, districts, inp))
             w = _deep_merge(w, {"drift": {"seed_node": node}})
-            resolved = resolve_world(w, base, network, n_districts)
+            resolved = resolve_world(w, base, network, n_districts, b["profile"])
         validate_world(resolved, districts)
         worlds.append(resolved)
     runs = [resolve_run(r, base, pipelines) for r in expand_axes(study.get("runs"))]

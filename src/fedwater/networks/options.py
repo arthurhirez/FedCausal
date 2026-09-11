@@ -54,6 +54,75 @@ def pattern_lengths(wn) -> dict[str, int]:
             for p in wn.pattern_name_list}
 
 
+def components(wn) -> dict:
+    """Component census, in the shape the simulation cares about.
+
+    ``has_storage`` is the dispatch flag, not ``n_tanks``: the presence of
+    storage is what turns a network from a sequence of independent
+    steady-state solves into a dynamic system, where continuity holds over the
+    horizon rather than at each step and a district's supply can be borrowed
+    from a tank filled hours earlier.
+    """
+    pump_kinds: dict[str, int] = {}
+    for name in wn.pump_name_list:
+        kind = str(getattr(wn.get_link(name), "pump_type", "?")).upper()
+        pump_kinds[kind] = pump_kinds.get(kind, 0) + 1
+    valve_kinds: dict[str, int] = {}
+    for name in wn.valve_name_list:
+        kind = str(getattr(wn.get_link(name), "valve_type", "?")).upper()
+        valve_kinds[kind] = valve_kinds.get(kind, 0) + 1
+    return {
+        "n_junctions": len(wn.junction_name_list),
+        "n_reservoirs": len(wn.reservoir_name_list),
+        "n_tanks": len(wn.tank_name_list),
+        "n_pipes": len(wn.pipe_name_list),
+        "n_pumps": len(wn.pump_name_list),
+        "n_valves": len(wn.valve_name_list),
+        "n_curves": len(wn.curve_name_list),
+        "n_controls": len(wn.control_name_list),
+        "n_patterns": len(wn.pattern_name_list),
+        "has_storage": bool(wn.tank_name_list),
+        "has_pumps": bool(wn.pump_name_list),
+        "has_valves": bool(wn.valve_name_list),
+        "pump_types": ",".join(f"{k}:{v}" for k, v in sorted(pump_kinds.items())),
+        "valve_types": ",".join(f"{k}:{v}" for k, v in sorted(valve_kinds.items())),
+    }
+
+
+def normalize_demand_slots(wn) -> dict:
+    """Give every junction exactly one demand timeseries entry.
+
+    ``run_hydraulics`` writes the synthesized series into
+    ``demand_timeseries_list[0]`` and assumes that entry is the whole of the
+    node's demand. Two ways an ``.inp`` breaks that assumption:
+
+    * a junction with NO entry (nothing to write into -- an ``IndexError``);
+    * a junction with SEVERAL, from a ``[DEMANDS]`` block carrying extra
+      demand categories. Slot 0 would be overwritten and the remaining
+      categories would keep drawing their original ``.inp`` demand on top of
+      the synthesized series -- unsynthesized volume, in the model, invisible
+      to V2 because V2 compares only what it wrote.
+
+    Extra entries are folded into slot 0's base value before being dropped, so
+    the node's raw base demand -- which ``build_portfolios`` anchors on -- is
+    preserved exactly. Returns what it touched.
+    """
+    added, merged = [], []
+    for name in wn.junction_name_list:
+        node = wn.get_node(name)
+        dtl = node.demand_timeseries_list
+        if len(dtl) == 0:
+            node.add_demand(base=0.0, pattern_name=None)
+            added.append(name)
+        elif len(dtl) > 1:
+            extra = sum(float(ts.base_value or 0.0) for ts in list(dtl)[1:])
+            while len(dtl) > 1:
+                dtl.pop()
+            dtl[0].base_value = float(dtl[0].base_value or 0.0) + extra
+            merged.append(name)
+    return {"added_empty_slot": added, "merged_extra_categories": merged}
+
+
 # --------------------------------------------------------------------------
 # transforms
 # --------------------------------------------------------------------------

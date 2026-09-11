@@ -13,6 +13,37 @@
 # level information, so a level-coded regime is discarded by the scaler,
 # while a weekday/weekend gate and a night-floor change survive it.
 # =========================================================================
+# NETWORK-SCOPED PARAMETERS -- read this before editing anything below.
+#
+# A handful of keys here are `null`. That is not "unset"; it is a declaration
+# that the key's correct value is a fact about the NETWORK rather than about
+# the scenario, and must come from the selected bundle's
+# data/01_raw/<network>/profile.yml, under its `network_params:` block.
+# Every such key is tagged NETWORK-SCOPED where it appears.
+#
+# The resolver (src/fedwater/networks/profile.py) ONLY EVER FILLS NULLS. That
+# single property is what makes it safe to run in two places at once:
+#   * experiments.spec.resolve_world applies it to these base parameters
+#     before building a world's override blocks, so the resolved value lands
+#     in conf/local/parameters.yml AND in the world's content hash -- editing
+#     a profile therefore correctly invalidates that network's worlds;
+#   * network_prep.resolve_network_parameters applies it inside a plain
+#     `kedro run`, where there is no engine.
+# A study that sets the key explicitly leaves nothing to fill, so the study
+# always wins and the order of application does not matter. No sentinel flag.
+#
+# Downstream nodes read the RESOLVED blocks -- `hydraulics_cfg`,
+# `scenario_cfg`, `validation_cfg` -- never `params:hydraulics` and friends,
+# so a null placeholder cannot reach a node.
+#
+# Why these five and not more: each was a SILENT wrong answer after a network
+# switch, not a crash. anchor_scale 0.05 is right for Graeme (5557 L/s of base
+# demand against a ~1100 L/s frontier) and absurd for KY7 (67 L/s against
+# ~90). income_landuse_mapping is POSITIONAL over districts, so a five-entry
+# list on a four-district network is a DIFFERENT SCENARIO, not merely a wrong
+# one. The list is deliberately short and closed: a profile must not be able
+# to reach the `fl` block, which belongs to the RUN identity, not the world's.
+
 seed: 42
 start_date: "2024-01-01"
 
@@ -28,7 +59,10 @@ time:
   resolution_h: 1       # sensor/pattern resolution in hours
 
 hydraulics:
-  anchor_scale: 0.05    # node demand anchor = inp base demand x this scale.
+  anchor_scale: null    # NETWORK-SCOPED. node demand anchor = inp base demand
+                        # x this scale. Graeme 0.05, KY7 0.5 -- the difference
+                        # is physical, not tuning: the two files sit at very
+                        # different distances from their own capacity.
                         # Unchanged by the refactor: the capacity frontier sits
                         # at ~1050-1200 L/s network peak (min pressure crosses
                         # the 5 mca floor there), and undrifted land-use
@@ -38,6 +72,23 @@ hydraulics:
                         # including commercial districts near zero at 3am.
                         # Re-confirm jointly with `scenario.beta` over
                         # anchors (0.03, 0.04, 0.05) before quoting either.
+  expected_headloss: null # NETWORK-SCOPED. ASSERTED against the .inp, never
+                        # coerced: silently switching a network from H-W to
+                        # D-W changes every pipe's friction with no papertrail.
+  inpfile_units: LPS      # units of any .inp written back out. NOT the units
+                        # the file was read in: wntr converts to SI on load
+                        # regardless, so a GPM file (KY7) and an LPS file
+                        # (Graeme) arrive identically. This only stops a model
+                        # written back out from being a GPM/SI hybrid.
+  normalize_pattern_length: 24  # EPANET WRAPS a pattern when it runs out, so a
+                        # ragged length walks its cycle backwards a little each
+                        # day. KY7 ships a 23-step ENRG1. Exact multiples of 24
+                        # are LEFT ALONE -- truncating D-Town's 168-step weekly
+                        # patterns would delete the weekday/weekend structure
+                        # the land-use model exists to carry. Junction demand
+                        # patterns are replaced wholesale by run_hydraulics;
+                        # this is for reservoir-head, pump-speed and energy
+                        # patterns, which are not.
   demand_multiplier: 1.0  # pins EPANET's global multiplier (inp had 0.2!)
   demand_model: DD        # demand-driven; PDD available for stress studies.
                           # Under DD an over-capacity regime reports negative
@@ -65,20 +116,29 @@ scenario:
   # income initial {L,M,H} + land-use initial {R,M,C,I}; 'M' is disambiguated
   # by position (medium income vs mixed land use). Spelled out here for
   # auditability; the engine's `consumption_map` encodes the same thing.
-  income_landuse_mapping:
-    - [low, residential]  # District_A
-    - [low, residential]        # District_B
-    - [low, residential]   # District_C
-    - [low, industrial]  # District_D
-    - [low, industrial]  # District_E
+  income_landuse_mapping: null   # NETWORK-SCOPED. Positional over districts in
+                                 # name order, so both its LENGTH and its
+                                 # meaning are network-specific. Lives in each
+                                 # bundle's profile.yml.
   drift:
-    tgt_district: District_D
-    seed_node: null             # null = auto-pick the district's largest-base-
-                                # demand junction, skipping zero-demand trunk
-                                # nodes. A hardcoded id here is network-specific
-                                # and silently wrong after a network switch;
-                                # per-network overrides go in profile.yml.
-    warmup_months: 4            # MUST be >= 1: apply_drift_ramp blends against
+    tgt_district: null          # NETWORK-SCOPED. Names a district that must
+                                # exist in the selected bundle.
+    seed_node: null             # NETWORK-SCOPED, but resolved by its own rule
+                                # (networks.profile.resolve_seed_node), not by
+                                # `network_params`. Precedence, highest first:
+                                # this key when set explicitly -- which is what
+                                # the experiments engine writes for every world
+                                # -- then the bundle's profile.yml
+                                # `drift_seed_nodes`, then auto-pick (the
+                                # district's largest-base-demand junction,
+                                # skipping zero-demand trunk nodes). Both
+                                # build_drift_schedule and experiments.spec go
+                                # through that one function: before, the
+                                # profile override was read in spec ONLY, so a
+                                # plain `kedro run` silently used a different
+                                # origin node than the study it was meant to
+                                # reproduce.
+    warmup_months: 2            # MUST be >= 1: apply_drift_ramp blends against
                                 # the month BEFORE the switch, so a node
                                 # drifting at month 0 has nothing to blend from.
     growth_chance: 0.8          # per-month chance the drift front advances
@@ -87,7 +147,7 @@ scenario:
                                 # a short horizon leaves the district only
                                 # partially converted.
     to_income: low
-    to_land_use: residential
+    to_land_use: commercial
 
 # --------------------------------------------------------------- land use --
 land_use:
@@ -244,8 +304,32 @@ noise:                  # instrumentation layer (separate from behaviour)
 validation:
   mass_balance_rtol: 1.0e-6
   volume_rtol: 1.0e-3
-  hard_pressure_floor_mca: 5.0
-  pressure_band_mca: [10.0, 50.0]     # ABNT NBR 12218 residential band
+  hard_pressure_floor_mca: 5.0        # applied to CONSUMER junctions only --
+                                      # junctions with a non-zero .inp base
+                                      # demand. Tanks report a water level, not
+                                      # a pressure, and a zero-demand connector
+                                      # has no customer behind it: KY7's
+                                      # I-Pump-1 sits at -8.6 mca by design,
+                                      # being a pump suction node above its
+                                      # reservoir's water level.
+  tank_floor_max_share: 0.05          # V8. Share of the horizon a tank may
+                                      # spend against its min level. The
+                                      # obvious test -- did the level fall from
+                                      # start to end -- reads ~0 once a tank
+                                      # locks into its control cycle, whatever
+                                      # the load; time-on-floor is the quantity
+                                      # that is monotone in demand.
+  tank_level_tol_m: 0.01              # what counts as "against" a limit
+  pressure_band_mca: null             # NETWORK-SCOPED. ABNT NBR 12218 gives
+                                      # [10, 50] for a Brazilian residential
+                                      # network, but a band is only meaningful
+                                      # against a given elevation spread: KY7
+                                      # has 70 m of it and three tanks floating
+                                      # at 202-219 m, so a third of the network
+                                      # is above 50 mca at every hour by
+                                      # construction. Left in the bundle so V4
+                                      # stays a real check instead of a warning
+                                      # that always fires.
   pressure_band_min_share: 0.98
   unit_m3_month_band: [4.0, 45.0]     # V5: applies to RESIDENTIAL plots only.
                                       # Note this is now a cheap table
@@ -330,8 +414,22 @@ fl:                         # ---- federated learning over the client CSVs ----
     device: cpu
   dependence:              # federated dependence detection & quantification
     max_lag_windows: 6      # PC1 lead-lag search range, in window units
-    n_surrogates: 200       # p floor 1/201: a lone dependent pair among the
-                            # 10 still clears BH-FDR at alpha=0.05
+    n_surrogates: 200       # DEPENDS ON THE DISTRICT COUNT, which is now a
+                            # per-network fact. A circular-shift p cannot go
+                            # below 1/(n_surrogates+1), and BH-FDR rejects the
+                            # smallest of m = D*(D-1)/2 pair p-values only if
+                            # it is <= alpha/m. So a LONE dependent pair is
+                            # detectable at all only when
+                            #     n_surrogates >= m/alpha - 1.
+                            # At alpha=0.05: >=119 for Graeme's 5 districts
+                            # (10 pairs), >=119 also for KY7's 4 (6 pairs), but
+                            # >=299 at 6 districts and >=559 at 8. 200 was
+                            # tuned for 10 pairs and clears it by 0.00002.
+                            # LEFT AT 200 on purpose -- the FL side is the next
+                            # intervention and this is not a crash, it is a
+                            # silent loss of power. Recompute it before
+                            # reporting a dependence result on any network with
+                            # six or more districts.
     n_surrogates_expensive: 50
   attribution:             # dependence-aware drift correction (C0..C3)
     reference_months: 6     # scale/weights calibration window (see drift)

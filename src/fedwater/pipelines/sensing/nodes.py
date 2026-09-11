@@ -10,6 +10,8 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from fedwater.hashing import stable_hash
+
 
 def extract_sensor_series(pressures: pd.DataFrame, flows: pd.DataFrame,
                           network_profile: dict) -> pd.DataFrame:
@@ -38,11 +40,22 @@ def extract_sensor_series(pressures: pd.DataFrame, flows: pd.DataFrame,
 
 def add_measurement_noise(sensor_series: pd.DataFrame, noise: dict,
                           seed: int) -> pd.DataFrame:
-    """observed = quantize(true + eps), eps keyed per sensor for auditability."""
+    """observed = quantize(true + eps), eps keyed per sensor for auditability.
+
+    The key goes through ``fedwater.hashing.stable_hash``, NOT the builtin
+    ``hash``. ``hash()`` on a str is salted per process (PEP 456), so the
+    previous version drew a DIFFERENT noise realisation every time the same
+    world was rerun. The true ``value`` column was identical and ``observed``
+    was not, which is the worst shape for the bug to take: the world cache is
+    content-addressed, so "same sim_hash" was taken to mean "same client
+    data", and it did not -- ``client_datasets`` is downstream of
+    ``observed``, so every replicate silently varied the instrumentation layer
+    alongside whatever it meant to vary.
+    """
     df = sensor_series.copy()
     observed = np.empty(len(df))
     for (sensor, kind), grp in df.groupby(["sensor", "kind"]):
-        rng = np.random.default_rng([seed, hash(sensor) % 2**31])
+        rng = np.random.default_rng([seed, stable_hash(sensor)])
         sigma = noise[f"{kind}_sigma"]
         q = noise[f"{kind}_quantization"]
         vals = grp["value"].to_numpy() + rng.normal(0.0, sigma, len(grp))

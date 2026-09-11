@@ -33,6 +33,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from fedwater.networks import profile as nprofile
 from fedwater.networks.partition import auto_seed_node, district_nodes
 
 SECONDS_PER_DAY = 86400
@@ -215,7 +216,10 @@ def build_portfolios(wn, districts: dict, landuse_factors: pd.DataFrame,
     for district, nodes in district_nodes(districts).items():
         income, land_use_code = mapping[district]
         for node in nodes:
-            base_si = wn.get_node(node).demand_timeseries_list[0].base_value  # m3/s
+            # configure_network guarantees exactly one demand slot per
+            # junction, so slot 0 IS the node's raw base demand.
+            slots = wn.get_node(node).demand_timeseries_list
+            base_si = float(slots[0].base_value or 0.0) if len(slots) else 0.0
             anchor = base_si * anchor_scale * SECONDS_PER_DAY * ANCHOR_DAYS_PER_MONTH
             rows += _plots(node, district, income, land_use_code, anchor,
                            anchor * level[(income, land_use_code)],
@@ -237,8 +241,8 @@ def build_portfolios(wn, districts: dict, landuse_factors: pd.DataFrame,
 # --------------------------------------------------------------------------
 # drift
 # --------------------------------------------------------------------------
-def build_drift_schedule(wn, districts: dict, scenario: dict,
-                         seed: int) -> pd.DataFrame:
+def build_drift_schedule(wn, districts: dict, network_profile: dict,
+                         scenario: dict, seed: int) -> pd.DataFrame:
     """Drift as diffusion on the target district's subgraph — ground truth.
 
     From ``seed_node``, each post-warmup month converts (with probability
@@ -268,17 +272,20 @@ def build_drift_schedule(wn, districts: dict, scenario: dict,
     nodes = set(district_nodes(districts)[district])
 
     G = wn.to_graph().to_undirected().subgraph(nodes)
-    # A null seed node means auto-pick: the district's largest-base-demand
-    # junction, skipping zero-demand trunk nodes. Same rule the experiments
-    # engine has always applied when a study retargets the drift district --
-    # it lives in networks.partition now so a plain `kedro run` and the engine
-    # cannot disagree. The diffusion itself is untouched.
-    if drift.get("seed_node") in (None, "", "None"):
-        seed_node = auto_seed_node(wn, districts, district)
-    else:
-        seed_node = str(drift["seed_node"])
+    # Seed precedence lives in networks.profile.resolve_seed_node and is
+    # shared with experiments.spec, so a plain `kedro run` and the engine
+    # cannot pick different origins: explicit scenario value (what a study
+    # writes) > the bundle's drift_seed_nodes > the auto-picker. The diffusion
+    # itself is untouched.
+    seed_node = nprofile.resolve_seed_node(
+        drift.get("seed_node"), network_profile, district,
+        lambda: auto_seed_node(wn, districts, district))
     if seed_node not in nodes:
-        raise ValueError(f"seed_node {seed_node} not in {district}")
+        raise ValueError(
+            f"drift seed_node {seed_node!r} is not a junction of {district} "
+            f"on network {network_profile.get('name', '?')!r}. A seed node id "
+            "is NETWORK-SPECIFIC: check scenario.drift.seed_node, or the "
+            "bundle's profile.yml `drift_seed_nodes`.")
 
     drifted = {seed_node: warmup}
     frontier = {seed_node}
