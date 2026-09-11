@@ -21,6 +21,11 @@ bootstrap gotcha), and cache-or-run — now keyed by **content hash** of the
 effective configuration instead of an ordinal, so editing a spec can never
 silently reuse a stale world.
 
+The selected network travels separately from the parameter override: it is
+written to ``conf/local/globals.yml``, which is what the catalog interpolates
+into the ``.inp`` / districts / profile filepaths. It is still part of the
+world hash, so a world can never be reused across networks.
+
 Failure policy (a): a run/world that fails is *recorded* (status + stdout
 tail in its manifest) and the sweep continues — infeasibility is data.
 Policy (b), the auto-anchor retry ladder, is implemented below but its
@@ -154,6 +159,18 @@ class ExperimentEngine:
         shutil.copytree(self.project / "data" / "01_raw",
                         dest / "data" / "01_raw")
 
+    @staticmethod
+    def _write_local(clone: Path, params: dict, globals_: dict | None) -> None:
+        """Full-block conf/local overrides. `globals` selects the network
+        bundle the catalog interpolates; `parameters` is everything else."""
+        local = clone / "conf" / "local"
+        local.mkdir(parents=True, exist_ok=True)
+        (local / "parameters.yml").write_text(
+            yaml.safe_dump(params, sort_keys=False))
+        if globals_:
+            (local / "globals.yml").write_text(
+                yaml.safe_dump(globals_, sort_keys=False))
+
     def _kedro(self, cwd: Path, pipeline: str | None = None):
         cmd = [sys.executable, "-m", "kedro", "run"]
         if pipeline:
@@ -188,8 +205,7 @@ class ExperimentEngine:
 
         clone = wdir / "clone"
         self._materialize_clone(clone)
-        (clone / "conf" / "local" / "parameters.yml").write_text(
-            yaml.safe_dump(world["override"], sort_keys=False))
+        self._write_local(clone, world["override"], world.get("globals"))
         result, seconds = self._kedro(clone)
         missing = [rel for rel in WORLD_REQUIRED
                    if not (clone / rel).exists()]
@@ -280,9 +296,8 @@ class ExperimentEngine:
                 # 08_reporting carries the sim-side reports (V-checks, oracle
                 # structure recovery); run pipelines only ADD files there.
                 _link_tree(wdir / "clone" / rel, clone / rel)
-            (clone / "conf" / "local" / "parameters.yml").write_text(
-                yaml.safe_dump({**world["override"], "fl": run["fl"]},
-                               sort_keys=False))
+            self._write_local(clone, {**world["override"], "fl": run["fl"]},
+                              world.get("globals"))
             stage_tasks = {}
             for pipeline in run["pipelines"]:
                 result, seconds = self._kedro(clone, pipeline)

@@ -3,15 +3,85 @@
 # to evaluate methods, never to train them.
 # =========================================================================
 
-graeme_network:
+# --- the selected network -------------------------------------------------
+# ${globals:network} comes from conf/base/globals.yml and is overridable for a
+# single run via conf/local/globals.yml (which is what the experiments engine
+# writes). A bundle is a directory under data/01_raw/ holding these three files.
+
+network_inp:
   type: fedwater.datasets.WntrNetworkDataset
-  filepath: data/01_raw/Graeme.inp
+  filepath: data/01_raw/${globals:network}/network.inp
 
 districts:
   type: kedro_datasets.yaml.YAMLDataset
-  filepath: data/01_raw/districts_graeme.yml
+  filepath: data/01_raw/${globals:network}/districts.yml
+
+network_profile:
+  type: kedro_datasets.yaml.YAMLDataset
+  filepath: data/01_raw/${globals:network}/profile.yml
+
+# --- assessment (pre-flight; not part of __default__) ---------------------
+# Namespaced by network so two networks' reports never overwrite each other.
+
+network_inventory:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/assessment/${globals:network}/inventory.csv
+
+assessment_partition:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/assessment/${globals:network}/partition.csv
+
+assessment_crossing_links:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/assessment/${globals:network}/crossing_links.csv
+
+conditioning_tier:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/assessment/${globals:network}/conditioning_tier.csv
+
+conditioning_attempts:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/assessment/${globals:network}/conditioning_attempts.csv
+
+conditioning_recipe:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/assessment/${globals:network}/conditioning_recipe.csv
+
+capacity_summary:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/assessment/${globals:network}/capacity_summary.csv
+
+capacity_curve:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/assessment/${globals:network}/capacity_curve.csv
+
+capacity_defects:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/assessment/${globals:network}/capacity_defects.csv
+
+capacity_binding:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/assessment/${globals:network}/capacity_binding.csv
+
+assessment_report:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/assessment/${globals:network}/REPORT.csv
 
 # --- network_prep ---------------------------------------------------------
+# Provenance for the network-scoped parameters: which of them came from
+# conf/ and which from the bundle's profile.yml. Written on every run so a
+# world's artifacts record the operating point they were actually built at.
+network_params_report:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/network_params_report.csv
+
+# What configure_network found in the .inp and what it pinned: declared unit
+# system, headloss formula, the file's own demand multiplier, the component
+# census (tanks/pumps/valves/controls), and any pattern lengths it normalised.
+network_prep_report:
+  type: pandas.CSVDataset
+  filepath: data/08_reporting/network_prep_report.csv
+
 wn_variant:
   type: pickle.PickleDataset
   filepath: data/02_intermediate/wn_variant.pkl
@@ -78,6 +148,12 @@ client_datasets:
     type: pandas.CSVDataset
     save_args: {index: false}
   filename_suffix: ".csv"
+  # A PartitionedDataset ADDS partitions by default, it does not replace the
+  # directory. District names are per-network, so switching networks left the
+  # previous one's clients behind: a KY7 run (districts A-D) inherited Graeme's
+  # District_E.csv, and any FL stage reading this folder would have trained a
+  # fifth client on a district the world does not contain.
+  overwrite: true
 
 # --- validation & dependence ground truth ---------------------------------
 validation_report:

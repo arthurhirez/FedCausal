@@ -8,7 +8,9 @@
 # analysis on a fixed world (fl seed, stride, batch size, rounds, surrogate
 # counts). Cheap; many runs reuse one cached world.
 #
-# Consumption maps are 5 two-char tokens in district order A..E:
+# Consumption maps are two-char tokens, ONE PER DISTRICT, in district order.
+# Five on Graeme and D-Town, FOUR on KY7 -- the count comes from the selected
+# bundle, and a mismatch raises rather than being padded or truncated:
 #   income   {L, M, H}  = low / medium / high
 #   land use {R, M, C, I} = residential / mixed / commercial / industrial
 # 'M' is disambiguated by position. e.g. LR_LM_LC_LR_LR = all incomes low;
@@ -22,6 +24,27 @@
 # `data/09_experiments/worlds/` must be re-simulated in full.
 # =========================================================================
 root: data/09_experiments
+
+# `network` is an ordinary world axis. Omit it and the study uses whatever
+# conf/base/globals.yml selects; put it under worlds.fixed or worlds.grid to
+# pin or sweep it:
+#
+# EVERY study below now PINS its network rather than inheriting the global.
+# Inheriting was a trap: `consumption_map` is positional over districts, so
+# the moment conf/base/globals.yml moved to a network with a different
+# district count, all 21 legacy studies stopped expanding. Failing loudly is
+# the correct behaviour and it is what happened -- but a study that says
+# which network it is a study OF cannot be broken by an unrelated switch.
+#
+#     worlds:
+#       grid:
+#         network: [graeme, dtown]
+#
+# It is part of the world hash, so a world is never reused across networks.
+# Two caveats when sweeping it: `consumption_map` is POSITIONAL over districts
+# in name order, so the same string means different things on two networks; and
+# `drift.seed_node` is a network-specific id -- leave it unset and let the
+# auto-picker (largest-base-demand junction) choose per network.
 
 studies:
 
@@ -37,6 +60,7 @@ studies:
       shipped horizon.
     worlds:
       fixed:
+        network: graeme
         sim_seed: 42
         n_months: 24
         anchor_scale: 0.05
@@ -66,6 +90,46 @@ studies:
     retain: [prototype_history, latent_trajectories,
              latent_trajectories_residualized]
 
+  # ------------------------------------------------ KY7 component probe --
+  # FIRST STUDY ON A NETWORK WITH STORAGE AND PUMPING. The measurand is the
+  # SIMULATOR, not the FL side: does the whole chain hold up on a network
+  # whose supply passes through a pump and three tanks?
+  #
+  # Everything except the drift is deliberately flat -- all four districts
+  # low income / residential -- so District_A's residential->commercial
+  # conversion is the ONLY regime change anywhere in the world.
+  #
+  # Note what is NOT written here: `anchor_scale` and `consumption_map` are
+  # omitted on purpose, so they resolve from data/01_raw/ky7/profile.yml
+  # (0.5, and four low/residential tokens). Writing `LR_LR_LR_LR` would work
+  # identically today and would silently become a five-token error if the
+  # partition ever changes. `seed_node` is likewise omitted: the profile
+  # declares J-507 for District_A, and that override now reaches a plain
+  # `kedro run` as well as the engine.
+  ky7_component_probe:
+    description: >
+      One baseline world on KY7 (481 junctions, 1 pump, 3 tanks): District_A
+      drifts low/residential -> low/commercial from J-507, 2-month warm-up,
+      24-month horizon. Pre-flight for storage-aware simulation.
+    worlds:
+      fixed:
+        network: ky7
+        sim_seed: 42
+        n_months: 24
+        beta: 0.35
+        coupling: {variant: baseline, close_fraction: 0.0}
+        drift: {tgt_district: District_A, warmup_months: 2,
+                to_income: low, to_land_use: commercial}
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+    runs:
+      fixed: {rounds: 8}
+    pipelines: []
+    harvest: [validation]
+
   # ------------------------------------------------------------ beta sweep --
   # The study the whole refactor exists to run. Same world in every respect
   # except the level dial: if regime legibility is carried by SHAPE rather
@@ -79,6 +143,7 @@ studies:
       shape-carried regime information from level-carried hydraulic risk.
     worlds:
       fixed:
+        network: graeme
         sim_seed: 42
         n_months: 12
         anchor_scale: 0.05
@@ -118,6 +183,7 @@ studies:
       exploratory scale.
     worlds:
       fixed:
+        network: graeme
         sim_seed: 42
         n_months: 12
         anchor_scale: 0.05
@@ -158,6 +224,7 @@ studies:
       District_D (residential -> commercial in every map).
     worlds:
       fixed:
+        network: graeme
         sim_seed: 42
         n_months: 12
         anchor_scale: 0.05
@@ -189,6 +256,7 @@ studies:
       single fl_seed kept in the run spec for when you run it.
     worlds:
       fixed:
+        network: graeme
         sim_seed: 42
         n_months: 12
         anchor_scale: 0.05
@@ -222,6 +290,7 @@ studies:
       worlds only for now; single fl_seed kept in the run spec.
     worlds:
       fixed:
+        network: graeme
         sim_seed: 42
         n_months: 30
         anchor_scale: 0.05
@@ -261,6 +330,7 @@ studies:
       worlds only for now; single fl_seed kept in the run spec.
     worlds:
       fixed:
+        network: graeme
         sim_seed: 42
         n_months: 30
         anchor_scale: 0.05
@@ -301,6 +371,7 @@ studies:
       worlds only for now; single fl_seed kept in the run spec.
     worlds:
       fixed:
+        network: graeme
         sim_seed: 42
         n_months: 30
         anchor_scale: 0.05
@@ -338,6 +409,7 @@ studies:
   resolution_probe:
     worlds:
       fixed:
+        network: graeme
         n_months: 6                    # 4x the steps per month, so shorten
         consumption_map: LR_LC_LC_LI_LR
       grid:
@@ -367,6 +439,7 @@ studies:
       only. Verifies horizon is a suffix, not a reparameterisation.
     worlds:
       fixed:
+        network: graeme
         sim_seed: 42
         anchor_scale: 0.05
         beta: 0.35
@@ -398,6 +471,7 @@ studies:
       worlds only for now; single fl_seed kept in the run spec.
     worlds:
       fixed:
+        network: graeme
         sim_seed: 42
         n_months: 30
         anchor_scale: 0.05
@@ -430,6 +504,7 @@ studies:
       worlds only for now; single fl_seed kept in the run spec.
     worlds:
       fixed:
+        network: graeme
         sim_seed: 42
         n_months: 30
         anchor_scale: 0.05
@@ -460,6 +535,7 @@ studies:
       worlds only for now; single fl_seed kept in the run spec.
     worlds:
       fixed:
+        network: graeme
         sim_seed: 42
         n_months: 30
         anchor_scale: 0.05
@@ -492,6 +568,7 @@ studies:
       worlds only for now; single fl_seed kept in the run spec.
     worlds:
       fixed:
+        network: graeme
         sim_seed: 42
         n_months: 30
         anchor_scale: 0.05
@@ -520,28 +597,28 @@ studies:
 
 
 
-  Dtown_test:
+  ky7_test:
     description: >
       worlds (drift origin A..E, auto seed node) at a 30-month horizon —
       worlds only for now; single fl_seed kept in the run spec.
     worlds:
       fixed:
+        network: ky7
         sim_seed: 42
         n_months: 40
-        anchor_scale: 0.05
+        anchor_scale: 0.5
         beta: 0.35
-        consumption_map: LR_LR_LR_LI_LI
+        consumption_map: LI_LR_LR_LI
         oracle:
           tiers: [1, 4]
           n_surrogates: 20 
           n_surrogates_expensive: 8
           minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
       grid:
-        drift: [{tgt_district: District_A, to_income: low, to_land_use: industrial, warmup_months: 8},
+        drift: [{tgt_district: District_A, to_income: low, to_land_use: residential, warmup_months: 8},
                 {tgt_district: District_B, to_income: low, to_land_use: industrial, warmup_months: 8},
                 {tgt_district: District_C, to_income: low, to_land_use: industrial, warmup_months: 8},
                 {tgt_district: District_D, to_income: low, to_land_use: residential, warmup_months: 8},
-                {tgt_district: District_E, to_income: low, to_land_use: residential, warmup_months: 8},
                 ]
     runs:
       fixed: {rounds: 8, step_size: 3, batch_size: 128,
@@ -676,6 +753,7 @@ studies:
       5 drift origins x 3 sim seeds, worlds only, 48-month horizon.
     worlds:
       fixed:
+        network: graeme
         n_months: 48
         anchor_scale: 0.05
         beta: 0.35
@@ -718,6 +796,7 @@ studies:
       sim seeds, worlds only, 48-month horizon.
     worlds:
       fixed:
+        network: graeme
         n_months: 48
         anchor_scale: 0.05
         beta: 0.35
@@ -764,6 +843,7 @@ studies:
       origins x 3 sim seeds. Exercises M2 (amplitude); M1 is a null control.
     worlds:
       fixed:
+        network: graeme
         n_months: 48
         anchor_scale: 0.05
         beta: 0.35
@@ -803,6 +883,7 @@ studies:
       level-carried degradation of the Jacobian.
     worlds:
       fixed:
+        network: graeme
         sim_seed: 42
         n_months: 48
         anchor_scale: 0.05
@@ -837,6 +918,7 @@ studies:
       Predicts near-zero unmixing gain when there is no mixing to undo.
     worlds:
       fixed:
+        network: graeme
         sim_seed: 42
         n_months: 48
         anchor_scale: 0.05
@@ -880,6 +962,7 @@ studies:
       from district size. One sim seed.
     worlds:
       fixed:
+        network: graeme
         sim_seed: 42
         n_months: 48
         anchor_scale: 0.05
