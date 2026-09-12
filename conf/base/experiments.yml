@@ -130,6 +130,48 @@ studies:
     pipelines: []
     harvest: [validation]
 
+  # ---------------------------------------------- D-Town component probe --
+  # FIRST STUDY ON A NETWORK WHERE PUMPS AND VALVES ARE LOAD-BEARING: 11 pumps
+  # on 3-point HEAD curves, 5 valves (4 PRV + 1 TCV), 24 controls, 7 tanks.
+  # The measurand is the SIMULATOR again, not the FL side.
+  #
+  # 12 months rather than 24: long enough for the tank/pump/control system to
+  # show its duty cycle, short enough to stay cheap while the component work
+  # is still moving. The drift is present but is NOT the point here.
+  #
+  # `anchor_scale` is omitted so it resolves from the bundle (0.25, measured:
+  # 0.35 drops below the pressure band and 0.50 collapses the network).
+  #
+  # BASELINE ONLY, deliberately. 7 of D-Town's 8 inter-district crossings are
+  # pumps or a valve and apply_coupling walks pipes only, so an `isolated`
+  # world here would close one pipe and leave Districts A, B and C fully fed
+  # through PU7/PU8/PU10 -- about half the network's water. Adding a coupling
+  # grid to this study before that is fixed would produce two worlds that are
+  # hydraulically almost identical and label them max/min coupling.
+  dtown_component_probe:
+    description: >
+      One baseline world on D-Town (399 junctions, 11 pumps, 5 valves, 7 tanks,
+      24 controls) at a 12-month horizon. Pre-flight for pump/valve-aware
+      simulation.
+    worlds:
+      fixed:
+        network: dtown
+        sim_seed: 42
+        n_months: 12
+        beta: 0.35
+        coupling: {variant: baseline, close_fraction: 0.0}
+        drift: {tgt_district: District_D, warmup_months: 2,
+                to_income: low, to_land_use: commercial}
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+    runs:
+      fixed: {rounds: 8}
+    pipelines: []
+    harvest: [validation]
+
   # ------------------------------------------------------------ beta sweep --
   # The study the whole refactor exists to run. Same world in every respect
   # except the level dial: if regime legibility is carried by SHAPE rather
@@ -597,28 +639,29 @@ studies:
 
 
 
-  ky7_test:
+  Dtown_test:
     description: >
       worlds (drift origin A..E, auto seed node) at a 30-month horizon —
       worlds only for now; single fl_seed kept in the run spec.
     worlds:
       fixed:
-        network: ky7
+        network: dtown
         sim_seed: 42
         n_months: 40
-        anchor_scale: 0.5
+        anchor_scale: 0.05
         beta: 0.35
-        consumption_map: LI_LR_LR_LI
+        consumption_map: LR_LR_LR_LI_LI
         oracle:
           tiers: [1, 4]
           n_surrogates: 20 
           n_surrogates_expensive: 8
           minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
       grid:
-        drift: [{tgt_district: District_A, to_income: low, to_land_use: residential, warmup_months: 8},
+        drift: [{tgt_district: District_A, to_income: low, to_land_use: industrial, warmup_months: 8},
                 {tgt_district: District_B, to_income: low, to_land_use: industrial, warmup_months: 8},
                 {tgt_district: District_C, to_income: low, to_land_use: industrial, warmup_months: 8},
                 {tgt_district: District_D, to_income: low, to_land_use: residential, warmup_months: 8},
+                {tgt_district: District_E, to_income: low, to_land_use: residential, warmup_months: 8},
                 ]
     runs:
       fixed: {rounds: 8, step_size: 3, batch_size: 128,

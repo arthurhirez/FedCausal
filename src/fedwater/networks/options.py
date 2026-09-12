@@ -89,6 +89,55 @@ def components(wn) -> dict:
     }
 
 
+def pin_solver(wn, accuracy: float, trials: int, unbalanced: str,
+               unbalanced_value: int = 10) -> dict:
+    """Pin the hydraulic SOLVER's convergence settings.
+
+    These are not cosmetic and they are not comparable across files. The three
+    shipped bundles disagree by two orders of magnitude -- Graeme 1e-3, KY7
+    1e-4, D-Town 1e-2 -- so leaving them alone means the numerical quality of a
+    world silently depends on which ``.inp`` it came from.
+
+    ``accuracy`` is the relative flow-change threshold at which EPANET stops
+    iterating. On a network of pipes and one reservoir a loose value costs
+    almost nothing. Add pumps, valves and controls and it costs a lot: at
+    D-Town's shipped ``ACCURACY 0.01`` the solve leaves a REAL continuity
+    residual of 6.4 L/s at the worst timestep, and V1 fails at every demand
+    anchor. Pinning 1e-5 takes that residual to exactly zero.
+
+    That distinction matters for how it was fixed. The KY7 float32 story ended
+    in a changed DENOMINATOR because the residual there was output precision
+    and genuinely irreducible. This one is not: it is an under-converged solve,
+    the error is physical, and a 6.4 L/s phantom leak that comes and goes is
+    exactly the artifact a changepoint or transfer-entropy detector would find
+    and report as a discovery. It had to be removed at the source, not
+    tolerated by a wider band.
+
+    ``trials`` is raised with ``accuracy`` because a tighter threshold needs
+    more iterations to reach; leaving trials at the file's value would just
+    move the failure from "converged loosely" to "ran out of trials".
+
+    ``unbalanced`` decides what EPANET does when it runs out of trials anyway.
+    All three bundles ship ``CONTINUE 10``: take 10 more iterations and then
+    REPORT THE ANSWER REGARDLESS, unconverged, with no error. That is the same
+    "a zero exit code is a claim, not evidence" failure the world cache's
+    ``WORLD_REQUIRED`` list exists to catch, one layer lower down.
+    """
+    before = {"accuracy": wn.options.hydraulic.accuracy,
+              "trials": wn.options.hydraulic.trials,
+              "unbalanced": f"{wn.options.hydraulic.unbalanced} "
+                            f"{wn.options.hydraulic.unbalanced_value}"}
+    wn.options.hydraulic.accuracy = float(accuracy)
+    wn.options.hydraulic.trials = int(trials)
+    wn.options.hydraulic.unbalanced = str(unbalanced).upper()
+    wn.options.hydraulic.unbalanced_value = int(unbalanced_value)
+    return {"solver_before": f"accuracy={before['accuracy']} "
+                             f"trials={before['trials']} "
+                             f"unbalanced={before['unbalanced']}",
+            "solver_after": f"accuracy={accuracy} trials={trials} "
+                            f"unbalanced={unbalanced} {unbalanced_value}"}
+
+
 def normalize_demand_slots(wn) -> dict:
     """Give every junction exactly one demand timeseries entry.
 

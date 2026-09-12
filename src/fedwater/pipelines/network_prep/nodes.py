@@ -72,6 +72,11 @@ def configure_network(wn, network_profile: dict, hydraulics: dict, time: dict):
     * **demand slots.** Every junction is given exactly one demand timeseries
       entry, so ``[0]`` downstream is the whole of a node's demand rather than
       the first of several ``[DEMANDS]`` categories.
+    * **solver settings.** ``accuracy``/``trials``/``unbalanced`` are pinned
+      from parameters rather than inherited. The three bundles ship
+      accuracies two orders of magnitude apart, and D-Town's shipped 1e-2
+      leaves a real 6.4 L/s continuity residual that fails V1 at every demand
+      anchor. See ``options.pin_solver``.
     * **pattern lengths.** Junction demand patterns are replaced wholesale by
       ``run_hydraulics``, but reservoir-head, pump-speed and energy patterns
       are not, and EPANET WRAPS a pattern when it runs out. KY7 ships a
@@ -86,6 +91,9 @@ def configure_network(wn, network_profile: dict, hydraulics: dict, time: dict):
     opt.pin_inpfile_units(wn, hydraulics.get("inpfile_units", "LPS"))
     opt.pin_demand_multiplier(wn, float(hydraulics["demand_multiplier"]))
     opt.pin_demand_model(wn, hydraulics["demand_model"])  # 'DD' or 'PDD'
+    solver = opt.pin_solver(wn, hydraulics["accuracy"], hydraulics["trials"],
+                            hydraulics["unbalanced"],
+                            hydraulics.get("unbalanced_value", 10))
 
     slots = opt.normalize_demand_slots(wn)
     fixed = opt.normalize_pattern_lengths(
@@ -105,6 +113,7 @@ def configure_network(wn, network_profile: dict, hydraulics: dict, time: dict):
         "timestep_s": int(time["resolution_h"] * 3600),
         "demand_model": hydraulics["demand_model"],
         "anchor_scale": float(hydraulics["anchor_scale"]),
+        **solver,
         "demand_slots_added": len(slots["added_empty_slot"]),
         "demand_slots_merged": len(slots["merged_extra_categories"]),
         "patterns_normalized": "; ".join(fixed),

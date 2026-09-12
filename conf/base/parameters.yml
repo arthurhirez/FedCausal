@@ -89,6 +89,32 @@ hydraulics:
                         # patterns are replaced wholesale by run_hydraulics;
                         # this is for reservoir-head, pump-speed and energy
                         # patterns, which are not.
+  # --- solver convergence: pinned, NOT inherited from the .inp -------------
+  # The three bundles ship accuracies two orders of magnitude apart (Graeme
+  # 1e-3, KY7 1e-4, D-Town 1e-2), so inheriting means the numerical quality of
+  # a world depends on which file it came from. On pipes-and-a-reservoir that
+  # is nearly free; with pumps, valves and controls it is not. At D-Town's
+  # shipped 1e-2 the solve leaves a REAL continuity residual -- 6.4 L/s at the
+  # worst timestep -- and V1 fails at every demand anchor. 1e-5 takes it to
+  # exactly zero.
+  #
+  # Note this is the OPPOSITE diagnosis to the KY7 float32 finding, and got
+  # the opposite fix. There the residual was output precision, irreducible,
+  # and the answer was a better denominator. Here it is an under-converged
+  # solve: the error is physical, and a phantom leak that comes and goes is
+  # exactly what a changepoint or TE detector would report as a discovery. It
+  # has to be removed at the source, never absorbed by a wider tolerance.
+  accuracy: 1.0e-5        # relative flow-change threshold to stop iterating
+  trials: 200             # raised with accuracy -- a tighter threshold needs
+                          # more iterations, or the failure just moves from
+                          # "converged loosely" to "ran out of trials"
+  unbalanced: STOP        # what EPANET does when it runs out of trials anyway.
+                          # All three bundles ship CONTINUE 10: iterate 10 more
+                          # times, then REPORT THE ANSWER REGARDLESS, with no
+                          # error. That is "a zero exit code is a claim, not
+                          # evidence" one layer below the world cache. STOP
+                          # makes a non-converged step raise.
+  unbalanced_value: 10
   demand_multiplier: 1.0  # pins EPANET's global multiplier (inp had 0.2!)
   demand_model: DD        # demand-driven; PDD available for stress studies.
                           # Under DD an over-capacity regime reports negative
