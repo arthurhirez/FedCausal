@@ -59,7 +59,10 @@ __all__ = ["settle_scan", "settle_month", "settle_report", "settled_window",
            "split_half_null", "horizon_check",
            "world_response", "build_mixture", "remix", "classify", "mixture_diagnostics",
            "tier_sensitivity", "purity_histogram", "dependence_matrix",
-           "dependence_spread", "zones",
+           "dependence_spread", "zones", "elasticity", "dependence",
+           "dependence_summary", "asymmetry", "estimator_checks",
+           "beta_linearity", "response_matrix", "null_vs_storage",
+           "plot_null_vs_storage", "plot_matrix",
            "core_connectivity", "beta_stability", "load_cells",
            "plot_settle", "plot_purity", "plot_dependence", "plot_mixture_bars",
            "plot_tier_map"]
@@ -223,6 +226,29 @@ def _profile(P: sp.Probe, cand: pd.DataFrame, lo: int, hi: int):
     return S, D, sign
 
 
+def _split_half_delta(P: sp.Probe, cand: pd.DataFrame,
+                      windows: tuple | None = None) -> np.ndarray:
+    """The split-half difference VECTOR, scaled like the measurement.
+
+    `split_half_null` returns its norm; the projection-based estimator needs
+    the vector itself so the noise can be projected onto the same direction as
+    the signal.
+    """
+    lo, hi = baseline_window(P)
+    sd = P.steps_day
+    mid = lo + ((hi - lo) // (2 * sd)) * sd
+    A, _, _ = _profile(P, cand, lo, mid)
+    B, _, _ = _profile(P, cand, mid, hi)
+    dN = sp.zscore(B) - sp.zscore(A)
+    if windows is None:
+        return dN
+    (a0, a1), (b0, b1) = windows
+    n_h, n_a, n_b = (mid - lo) / sd, (a1 - a0) / sd, (b1 - b0) / sd
+    if min(n_h, n_a, n_b) <= 0:
+        return dN
+    return dN * float(np.sqrt((1 / n_a + 1 / n_b) / (2 / n_h)))
+
+
 def split_half_null(P: sp.Probe, cand: pd.DataFrame,
                     windows: tuple | None = None) -> np.ndarray:
     """Per-sensor noise floor for ||dz||, from two halves of the init phase.
@@ -276,9 +302,20 @@ def world_response(P: sp.Probe, cand: pd.DataFrame, slack: float = 0.01,
 
     dS = sp.zscore(S1) - sp.zscore(S0)
     dD = sp.zscore(D1)[k] - sp.zscore(D0)[k]
-    den = float(dD @ dD)
-    g = (dS @ dD) / den if den > EPS else np.zeros(len(dS))
-    resid = np.linalg.norm(dS - np.outer(g, dD), axis=1)
+    excite = float(np.linalg.norm(dD))            # size of THIS excitation
+    u = dD / excite if excite > EPS else dD * 0.0  # its unit direction
+    proj = dS @ u                                  # response along that direction
+    g = proj / excite if excite > EPS else np.zeros(len(dS))
+    resid = np.linalg.norm(dS - np.outer(proj, u), axis=1)
+
+    # The noise floor FOR THE PROJECTION, not for the norm. Projecting the
+    # split-half difference onto the same unit direction gives the error this
+    # particular measurement carries; it is much smaller than ||dz||, because a
+    # projection averages the noise over the profile instead of accumulating
+    # it. Using the norm-null to gate a projection is what forced `null_factor`
+    # so high that mixtures collapsed to one-hot.
+    dN = _split_half_delta(P, cand, windows=((lo0, hi0), (lo1, hi1)))
+    nu = np.abs(dN @ u)
 
     # level, kept separate on purpose: a gauge can move a lot in volume and
     # not at all in signature, and only the signature survives the FL scaler.
@@ -291,7 +328,8 @@ def world_response(P: sp.Probe, cand: pd.DataFrame, slack: float = 0.01,
         "id": cand["id"].to_numpy(), "kind": cand["kind"].to_numpy(),
         "district": cand["district"].to_numpy(), "role": cand["role"].to_numpy(),
         "element": cand["element"].to_numpy(),
-        "drift_district": tgt, "g": g, "dz_norm": np.linalg.norm(dS, axis=1),
+        "drift_district": tgt, "g": g, "proj": proj, "nu": nu,
+        "excite": excite, "dz_norm": np.linalg.norm(dS, axis=1),
         "resid": resid,
         "null": split_half_null(P, cand, windows=((lo0, hi0), (lo1, hi1))),
         "null_raw": split_half_null(P, cand),
@@ -408,6 +446,11 @@ def build_mixture(probes: dict, slack: float = 0.01, pad: int = 1,
     G = G.reindex(columns=districts)
     DZ = gains.pivot(index="id", columns="drift_district", values="dz_norm") \
         .reindex(columns=districts)
+    PROJ = gains.pivot(index="id", columns="drift_district", values="proj") \
+        .reindex(columns=districts)
+    NU = gains.pivot(index="id", columns="drift_district", values="nu") \
+        .reindex(columns=districts)
+    EXC = gains.groupby("drift_district")["excite"].first().reindex(districts)
     NULL = gains.groupby("id")["null"].max().reindex(G.index)
     # A gauge whose init-phase series is constant (a pump on a fixed duty, a
     # closed valve) has a null of ~0, and dividing by it produced SNRs of
@@ -417,7 +460,8 @@ def build_mixture(probes: dict, slack: float = 0.01, pad: int = 1,
     degenerate = NULL.to_numpy() < floor
     NULL = pd.Series(np.maximum(NULL.to_numpy(), floor), index=NULL.index,
                      name="null")
-    base = {"degenerate": pd.Series(degenerate, index=NULL.index), "gains": gains, "G": G, "DZ": DZ, "null": NULL,
+    base = {"degenerate": pd.Series(degenerate, index=NULL.index), "gains": gains,
+            "PROJ": PROJ, "NU": NU, "EXC": EXC, "G": G, "DZ": DZ, "null": NULL,
             "districts": districts, "cand": cand}
     return remix(base, null_factor=null_factor, core_purity=core_purity,
                  foreign_max=foreign_max)
@@ -746,6 +790,325 @@ def zones(res: dict, kind: str = "flow", core_purity: float = 0.85,
     return pd.DataFrame(rows).round(3)
 
 
+
+# ==========================================================================
+# 4b. DEPENDENCE -- the corrected estimator
+# ==========================================================================
+# The share-based `dependence_matrix` above answers "of what this gauge saw,
+# what fraction came from district k". That is a composition, not a
+# dependence, and it has four defects that this section fixes.
+#
+# 1. IT DISCARDS MAGNITUDE. Two gauges whose absolute responses differ by
+#    1000x give identical rows once normalised to a simplex. "How much does
+#    j depend on k" is a gain, not a share.
+# 2. THE PER-WORLD NORMALISATION BIASES IT. g = <dz_s, u_k>/||u_k||^2 divides
+#    by the size of THAT world's excitation, so a district whose conversion
+#    produced a larger shape change is systematically under-credited. Shares
+#    built from those g's are not comparable across k.
+# 3. THE HARD `live` GATE MANUFACTURES SEPARABILITY. Gating on ||dz|| before
+#    normalising makes rows one-hot as soon as only one district clears, which
+#    is exactly what produced diag 1.000 / offdiag 0.000 on KY7 and D-Town at
+#    null_factor 3, against 0.69/0.077 on Graeme at 1.5. The threshold was
+#    reporting its own setting as a property of the network.
+# 4. THE ROWS ARE NOT COMPARABLE. Nothing normalises a district's response to
+#    its own scale, so a well-metered district and a poorly-metered one are
+#    read on different rulers.
+#
+# The corrected chain:
+#
+#     u_k    = dz_d(k) / ||dz_d(k)||           unit direction of k's change
+#     P[s,k] = <dz_s^(k), u_k>                 response along it
+#     nu     = |<split-half dz_s, u_k>|        noise ON THE SAME DIRECTION
+#     P~     = sign(P) * max(|P| - nu, 0)      SOFT threshold, no cliff
+#     E[s,k] = P~[s,k] / ||dz_d(k)||           per unit of excitation
+#
+#     D[j,k] = mean over district j's gauges of |E[s,k]|        (absolute)
+#     R[j,k] = D[j,k] / D[j,j]                                  (relative)
+#
+# `R` is the object the thesis needs: "a drift in k moves district j's meters
+# R[j,k] as much as an equivalent drift in j does". Its diagonal is 1 by
+# construction, the same gauges appear in numerator and denominator so the
+# placement confound largely cancels, and it is asymmetric, which is the
+# point.
+#
+# NAMING, because the over-claim is easy to make: this is OBSERVATIONAL
+# dependence. Each district's demand is generated independently in the
+# simulator, so nothing here says client j's demand depends on client k's. It
+# says client j's OBSERVATIONS are contaminated by client k's demand -- which
+# is precisely the confound federated training faces, and the reason a
+# measured version of it is worth having.
+
+
+def elasticity(base: dict, shrink: bool = True) -> pd.DataFrame:
+    """E[s,k]: sensor s's response per unit of district k's excitation.
+
+    Soft-thresholded against the projection noise, so a gauge that did not
+    respond decays to 0 smoothly instead of being cut at a threshold. Set
+    `shrink=False` to get the raw (unbiased but noisy) gains for comparison.
+    """
+    Pj, Nu = base["PROJ"].to_numpy(), base["NU"].to_numpy()
+    exc = base["EXC"].to_numpy()[None, :]
+    Pt = np.sign(Pj) * np.maximum(np.abs(Pj) - Nu, 0.0) if shrink else Pj
+    return pd.DataFrame(Pt / np.where(exc > EPS, exc, np.nan),
+                        index=base["PROJ"].index, columns=base["PROJ"].columns)
+
+
+def dependence(base: dict, kind: str = "flow", top: int | None = None,
+               shrink: bool = True, stat: str = "mean",
+               tier: str | None = None, mixture: pd.DataFrame | None = None):
+    """Observational dependence between districts. Returns (D, R, meta).
+
+    `D[j,k]` is district j's mean |elasticity| to district k's drift, in
+    z-units of the sensor per unit of demand-shape change. `R = D / diag(D)`
+    is the relative form and is the one to quote.
+
+    `top=None` uses EVERY gauge of that kind homed in j -- deliberately. Taking
+    the best few by own-district SNR selects the purest gauges and drives the
+    off-diagonal to zero by construction; that circularity is what the share
+    estimator suffered from. Pass `top` only to ask a placement question
+    ("what would the best k gauges see"), never to characterise the network.
+    """
+    E = elasticity(base, shrink=shrink)
+    cand = base["cand"].set_index("id")
+    ds = base["districts"]
+    home = cand["district"].reindex(E.index)
+    kinds = cand["kind"].reindex(E.index)
+    keep = kinds == kind
+    if tier is not None:
+        if mixture is None:
+            raise ValueError("tier filtering needs the mixture frame")
+        t = mixture.set_index("id")["tier"].reindex(E.index)
+        keep &= (t == tier)
+    if "degenerate_null" in cand:
+        keep &= ~cand["degenerate_null"].reindex(E.index).fillna(False).astype(bool)
+
+    rows, n = {}, {}
+    for j in ds:
+        sel = E[keep & (home == j)]
+        if top and len(sel):
+            snr = (base["DZ"].loc[sel.index, j] / base["null"].loc[sel.index])
+            sel = sel.loc[snr.nlargest(top).index]
+        n[j] = len(sel)
+        v = sel.abs()
+        rows[j] = (getattr(v, stat)().to_numpy() if len(sel)
+                   else np.full(len(ds), np.nan))
+    D = pd.DataFrame({j: rows[j] for j in ds}, index=ds).T
+    diag = pd.Series(np.diag(D.to_numpy()), index=ds)
+    R = D.div(diag.replace(0, np.nan), axis=0)
+    meta = pd.Series(n, name="n_gauges")
+    return D, R, meta
+
+
+def dependence_summary(R: pd.DataFrame) -> pd.DataFrame:
+    """Per district: how much it leaks out, how much leaks in, net direction.
+
+    `in_` is the mean of row j off-diagonal -- how contaminated j's meters are.
+    `out` is the mean of column j -- how much j's drift shows up elsewhere. A
+    district with high `out` and low `in_` is an upstream driver; the reverse
+    is a downstream sink. `net` is the difference, and it is the closest thing
+    to a direction this design supports.
+    """
+    A = R.to_numpy().copy()
+    np.fill_diagonal(A, np.nan)
+    out = pd.DataFrame({
+        "in_mean": np.nanmean(A, axis=1), "in_max": np.nanmax(A, axis=1),
+        "out_mean": np.nanmean(A, axis=0), "out_max": np.nanmax(A, axis=0),
+    }, index=R.index)
+    out["net"] = out["out_mean"] - out["in_mean"]
+    out["strongest_source"] = [R.columns[i] for i in np.nanargmax(A, axis=1)]
+    return out.round(3)
+
+
+def asymmetry(R: pd.DataFrame) -> pd.DataFrame:
+    """R[j,k] - R[k,j]. Positive means k influences j more than j influences k."""
+    return (R - R.T).round(3)
+
+
+def estimator_checks(base: dict, kind: str = "flow") -> pd.DataFrame:
+    """Does the estimator behave the way its derivation says it should?
+
+    `noise_pass_rate` -- share of (gauge, district) cells whose projection is
+    below its own noise floor. With D districts and one real driver per gauge
+    this should be substantial; near 0 means the noise floor is under-
+    estimated and everything looks significant.
+
+    `shrink_effect` -- correlation between raw and shrunk elasticities. Near 1
+    means soft-thresholding changed rankings very little and the result does
+    not hinge on it.
+
+    `diag_dominance` -- share of gauges whose largest |E| is their own
+    district. This is the honest version of "hit rate": it uses no threshold
+    and no tiering.
+    """
+    Pj, Nu = base["PROJ"].to_numpy(), base["NU"].to_numpy()
+    cand = base["cand"].set_index("id")
+    keep = (cand["kind"].reindex(base["PROJ"].index) == kind).to_numpy()
+    ds = base["districts"]
+    home = cand["district"].reindex(base["PROJ"].index).to_numpy()
+    hidx = np.array([ds.index(h) if h in ds else -1 for h in home])
+
+    Er = elasticity(base, shrink=False).to_numpy()[keep]
+    Es = elasticity(base, shrink=True).to_numpy()[keep]
+    ok = np.isfinite(Er) & np.isfinite(Es)
+    big = np.argmax(np.abs(Es), axis=1)
+    return pd.DataFrame([{
+        "kind": kind, "n_gauges": int(keep.sum()),
+        "noise_pass_rate": float((np.abs(Pj[keep]) <= Nu[keep]).mean()),
+        "shrink_effect_r": float(np.corrcoef(Er[ok].ravel(), Es[ok].ravel())[0, 1]),
+        "diag_dominance": float((big == hidx[keep]).mean()),
+        "median_nu_over_proj": float(np.median(
+            Nu[keep] / np.maximum(np.abs(Pj[keep]), EPS))),
+    }]).round(4)
+
+
+def beta_linearity(base_a: dict, base_b: dict, kind: str = "flow",
+                   label_a: str = "a", label_b: str = "b") -> pd.DataFrame:
+    """Is the response operator linear in the excitation?
+
+    `E` is already per unit of excitation, so if the network responds linearly
+    E is beta-invariant: correlation ~1 and slope ~1. A slope away from 1 is
+    the size of the non-linearity, and it is the quantity that decides whether
+    a dependence matrix measured at one operating point can be quoted at
+    another.
+    """
+    Ea, Eb = elasticity(base_a), elasticity(base_b)
+    idx = Ea.index.intersection(Eb.index)
+    cand = base_a["cand"].set_index("id")
+    idx = idx[(cand["kind"].reindex(idx) == kind).to_numpy()]
+    x = Ea.loc[idx].to_numpy().ravel()
+    y = Eb.loc[idx].to_numpy().ravel()
+    ok = np.isfinite(x) & np.isfinite(y) & ((np.abs(x) + np.abs(y)) > EPS)
+    x, y = x[ok], y[ok]
+    slope = float(x @ y / (x @ x)) if len(x) and (x @ x) > EPS else np.nan
+    return pd.DataFrame([{
+        "kind": kind, "compare": f"{label_a} vs {label_b}", "n": int(len(x)),
+        "r": float(np.corrcoef(x, y)[0, 1]) if len(x) > 2 else np.nan,
+        "slope": slope,
+        "median_ratio": float(np.median(y[np.abs(x) > EPS] / x[np.abs(x) > EPS]))
+        if (np.abs(x) > EPS).any() else np.nan,
+    }]).round(3)
+
+
+def response_matrix(base: dict, kind: str = "flow", top: int | None = 3,
+                    tier: str | None = None, mixture: pd.DataFrame | None = None,
+                    normalise: bool = True) -> pd.DataFrame:
+    """Rows = the district that DRIFTED, columns = where it was measured.
+
+    The transpose-orientation counterpart of `dependence`, matching the sweep's
+    `leak_matrix` layout so the two can be read together. With
+    `normalise=True` each row is divided by its own diagonal, so an entry is
+    "this drift showed up at j's meters x as strongly as at its own".
+    """
+    D, _, _ = dependence(base, kind=kind, top=top, tier=tier, mixture=mixture)
+    M = D.T                                   # rows: drifted, cols: observed
+    if normalise:
+        diag = pd.Series(np.diag(M.to_numpy()), index=M.index)
+        M = M.div(diag.replace(0, np.nan), axis=0)
+    return M
+
+
+
+# ==========================================================================
+# 4c. why is one network noisier than another?
+# ==========================================================================
+def null_vs_storage(P: sp.Probe, base: dict, kind: str = "pressure") -> dict:
+    """Regress each gauge's noise floor on its distance to storage.
+
+    The motivating observation: the baseline split-half null is ~0.27 on
+    Graeme, ~1.5 on D-Town and ~4.7 on KY7 -- and KY7 is the network whose
+    three tanks float the whole system above the reservoir head. If a gauge's
+    own noise floor grows with proximity to storage, then "how much storage
+    floats this district" is a pre-flight predictor of whether a network can
+    support this analysis at all, computable before any simulation.
+
+    Model: log(null) ~ hops_to_storage + elevation (pressure) or
+    log|mean flow| (flow). Hops are unweighted shortest-path steps on the pipe
+    graph to the nearest tank or reservoir -- crude, but it needs no
+    calibration and no assumption about which tank serves what.
+
+    Interpretation guard: a negative `hops` coefficient means noise FALLS with
+    distance from storage, i.e. storage is the noise source. A flat fit does
+    not clear storage -- it only says this predictor does not carry it.
+    """
+    import networkx as nx
+
+    ends = sp._link_endpoints(P)
+    G = nx.Graph()
+    for name, (u, v, _) in ends.items():
+        G.add_edge(u, v)
+    storage = set()
+    for attr in ("tank_name_list", "reservoir_name_list"):
+        storage |= set(getattr(P.wn, attr, []) or [])
+    storage &= set(G.nodes)
+    if not storage:
+        return {"table": pd.DataFrame(), "fit": None,
+                "note": "no tank or reservoir on the pipe graph"}
+
+    # one multi-source BFS instead of one per gauge
+    G.add_node("__STORAGE__")
+    for t in storage:
+        G.add_edge("__STORAGE__", t)
+    hops = nx.single_source_shortest_path_length(G, "__STORAGE__")
+    hops = {n: h - 1 for n, h in hops.items() if n != "__STORAGE__"}
+
+    null = base["null"]
+    cand = base["cand"].set_index("id")
+    rows = []
+    mean_q = P.flows.drop(columns=["month"], errors="ignore").abs().mean()
+    for gid, r in cand.iterrows():
+        if r["kind"] != kind or gid not in null.index:
+            continue
+        if kind == "pressure":
+            h = hops.get(r["element"])
+            extra = float(getattr(P.wn.get_node(r["element"]), "elevation", np.nan))
+            xname = "elevation"
+        else:
+            u, v, _ = ends.get(r["element"], (None, None, None))
+            hs = [hops.get(x) for x in (u, v) if hops.get(x) is not None]
+            h = min(hs) if hs else None
+            extra = float(np.log10(max(float(mean_q.get(r["element"], 0.0)), 1e-6)))
+            xname = "log10_mean_flow"
+        if h is None or not np.isfinite(extra):
+            continue
+        rows.append({"id": gid, "district": r["district"], "element": r["element"],
+                     "hops_to_storage": int(h), xname: extra,
+                     "null": float(null.loc[gid])})
+    tab = pd.DataFrame(rows)
+    if len(tab) < 10:
+        return {"table": tab, "fit": None, "note": "too few gauges to fit"}
+
+    y = np.log10(np.maximum(tab["null"].to_numpy(), 1e-9))
+    X = np.column_stack([np.ones(len(tab)), tab["hops_to_storage"].to_numpy(),
+                         tab[xname].to_numpy()])
+    coef, *_ = np.linalg.lstsq(X, y, rcond=None)
+    pred = X @ coef
+    ss_res = float(((y - pred) ** 2).sum())
+    ss_tot = float(((y - y.mean()) ** 2).sum())
+    fit = pd.DataFrame([{
+        "kind": kind, "n": len(tab), "r2": 1 - ss_res / max(ss_tot, EPS),
+        "intercept": coef[0], "b_hops": coef[1], f"b_{xname}": coef[2],
+        "r_hops_only": float(np.corrcoef(tab["hops_to_storage"], y)[0, 1]),
+        "null_median": float(tab["null"].median()),
+        "hops_median": float(tab["hops_to_storage"].median()),
+    }]).round(4)
+    return {"table": tab, "fit": fit, "xname": xname, "note": ""}
+
+
+def plot_null_vs_storage(res_ns: dict, ax=None, label: str = ""):
+    import matplotlib.pyplot as plt
+    if ax is None:
+        _, ax = plt.subplots(figsize=(5.2, 3.6))
+    t = res_ns["table"]
+    if not len(t):
+        return ax
+    ax.scatter(t["hops_to_storage"], t["null"], s=12, alpha=.5)
+    med = t.groupby("hops_to_storage")["null"].median()
+    ax.plot(med.index, med.to_numpy(), color="crimson", lw=1.6, marker="o", ms=3)
+    ax.set(yscale="log", xlabel="hops to nearest tank / reservoir",
+           ylabel="split-half null", title=label)
+    return ax
+
+
 # ==========================================================================
 # 5. figures
 # ==========================================================================
@@ -810,6 +1173,27 @@ def plot_dependence(A: pd.DataFrame, ax=None, title: str = ""):
             if np.isfinite(V[i, j]):
                 ax.text(j, i, f"{V[i, j]:.2f}", ha="center", va="center",
                         fontsize=7, color="w" if V[i, j] < 0.6 else "k")
+    return ax
+
+
+def plot_matrix(A: pd.DataFrame, ax=None, title: str = "", vmax: float | None = None,
+                xlabel: str = "", ylabel: str = "", cmap: str = "magma"):
+    """Annotated heatmap for any district x district matrix."""
+    import matplotlib.pyplot as plt
+    if ax is None:
+        _, ax = plt.subplots(figsize=(4.8, 4.2))
+    V = A.to_numpy(dtype=float)
+    hi = vmax if vmax is not None else float(np.nanmax(V)) or 1.0
+    ax.imshow(V, cmap=cmap, vmin=0, vmax=hi)
+    ax.set(xticks=range(A.shape[1]), yticks=range(A.shape[0]),
+           xlabel=xlabel, ylabel=ylabel, title=title)
+    ax.set_xticklabels([str(c).replace("District_", "") for c in A.columns])
+    ax.set_yticklabels([str(c).replace("District_", "") for c in A.index])
+    for i in range(V.shape[0]):
+        for j in range(V.shape[1]):
+            if np.isfinite(V[i, j]):
+                ax.text(j, i, f"{V[i, j]:.2f}", ha="center", va="center",
+                        fontsize=7, color="w" if V[i, j] < 0.6 * hi else "k")
     return ax
 
 
