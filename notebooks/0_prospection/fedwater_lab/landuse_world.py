@@ -32,6 +32,7 @@ Usage
 """
 from __future__ import annotations
 
+import copy
 import json
 import pathlib
 import shutil
@@ -127,6 +128,15 @@ class WorldCfg:
     to_land_use: str = "commercial"
     seed_node: str | None = None         # None -> profile's drift_seed_nodes, then auto
 
+    # Additional districts drifting SIMULTANEOUSLY, same target regime. Empty
+    # for every ordinary world, so nothing changes for existing hashes.
+    # `build_drift_schedule` already carries (to_income, to_land_use) per ROW
+    # and `evolve_assignments` / `apply_drift_ramp` read them per row, so a
+    # concatenated schedule is a schema-compatible extension -- no change to
+    # the drift engine, which stays out of scope. Used by the superposition
+    # test: is the response to two drifts the sum of the two responses?
+    co_targets: tuple = ()
+
     # --- dials -----------------------------------------------------------
     beta: float = 0.35
     anchor_scale: float | None = None    # None -> ANCHOR_SCALE[network]
@@ -158,9 +168,21 @@ class WorldCfg:
                            "anchor_scale explicitly")
         return float(ANCHOR_SCALE[self.network])
 
+    # Fields added AFTER worlds were already on disk. A world directory is
+    # content-addressed by `sim_hash(asdict(cfg))`, so merely adding a field
+    # renames every existing world and the whole cache goes invisible --
+    # which is what happened when `co_targets` was introduced. Omitting a
+    # field from the identity while it holds its default keeps the old hash
+    # byte-identical, and any world that actually uses the field still gets
+    # its own address. Add to this set, never remove from it.
+    _OMIT_IF_DEFAULT = {"co_targets": ()}
+
     def identity(self) -> dict:
         d = asdict(self)
         d["anchor_scale"] = self.resolved_anchor()
+        for key, default in self._OMIT_IF_DEFAULT.items():
+            if key in d and tuple(d[key] or ()) == tuple(default):
+                d.pop(key)
         return d
 
 
@@ -278,7 +300,21 @@ def build(cfg: WorldCfg, root, verbose: bool = True) -> dict:
     landuse_factors = US.build_landuse_factors(income_factors, params["land_use"], scen)
     portfolios = US.build_portfolios(wn, districts_yml, landuse_factors,
                                      income_factors, scen, params["land_use"], hyd)
-    schedule = US.build_drift_schedule(wn, districts_yml, profile, scen, params["seed"])
+    schedule = US.build_drift_schedule(wn, districts_yml, profile, scen,
+                                       params["seed"])
+    for extra in (cfg.co_targets or ()):
+        scen_x = copy.deepcopy(scen)
+        scen_x["drift"]["tgt_district"] = extra
+        # the primary's seed node is a node of the PRIMARY district; clearing
+        # it lets resolve_seed_node fall through to the bundle and then to the
+        # auto-picker for this district
+        scen_x["drift"]["seed_node"] = None
+        sx = US.build_drift_schedule(wn, districts_yml, profile, scen_x,
+                                     params["seed"])
+        schedule = pd.concat([schedule, sx], ignore_index=True)
+    if schedule["node"].duplicated().any():
+        raise ValueError("co-drift schedules overlap on a node; districts must "
+                         "be disjoint")
     timeline = US.evolve_assignments(portfolios, schedule, landuse_factors,
                                      income_factors, params["land_use"], scen)
 

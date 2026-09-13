@@ -227,7 +227,8 @@ def _profile(P: sp.Probe, cand: pd.DataFrame, lo: int, hi: int):
 
 
 def _split_half_delta(P: sp.Probe, cand: pd.DataFrame,
-                      windows: tuple | None = None) -> np.ndarray:
+                      windows: tuple | None = None,
+                      space: str = "shape") -> np.ndarray:
     """The split-half difference VECTOR, scaled like the measurement.
 
     `split_half_null` returns its norm; the projection-based estimator needs
@@ -239,7 +240,7 @@ def _split_half_delta(P: sp.Probe, cand: pd.DataFrame,
     mid = lo + ((hi - lo) // (2 * sd)) * sd
     A, _, _ = _profile(P, cand, lo, mid)
     B, _, _ = _profile(P, cand, mid, hi)
-    dN = sp.zscore(B) - sp.zscore(A)
+    dN = (sp.zscore(B) - sp.zscore(A)) if space == "shape" else (B - A)
     if windows is None:
         return dN
     (a0, a1), (b0, b1) = windows
@@ -317,6 +318,23 @@ def world_response(P: sp.Probe, cand: pd.DataFrame, slack: float = 0.01,
     dN = _split_half_delta(P, cand, windows=((lo0, hi0), (lo1, hi1)))
     nu = np.abs(dN @ u)
 
+    # The SAME estimator in native units (mca, L/s), not on z-scored profiles.
+    # Needed because the two channels answer to different excitations: Graeme's
+    # pressure elasticity tracked the volume level factor 9.19**beta almost
+    # exactly (slope 0.422 / 0.613 / 0.785 / 1.000 / 1.126 / 1.418 against a
+    # predicted 0.46 / 0.64 / 0.81 / 1.00 / 1.12 / 1.36), i.e. dividing by the
+    # SHAPE norm left a beta-dependent residue. In native units the excitation
+    # is the district's demand-profile change in L/s, which carries level and
+    # shape together, so E is the linearised operator itself and should be
+    # excitation-invariant if the network responds linearly.
+    dSn, dDn = S1 - S0, D1[k] - D0[k]
+    exc_n = float(np.linalg.norm(dDn))
+    un = dDn / exc_n if exc_n > EPS else dDn * 0.0
+    proj_n = dSn @ un
+    dNn = _split_half_delta(P, cand, windows=((lo0, hi0), (lo1, hi1)),
+                            space="native")
+    nu_n = np.abs(dNn @ un)
+
     # level, kept separate on purpose: a gauge can move a lot in volume and
     # not at all in signature, and only the signature survives the FL scaler.
     lvl0, lvl1 = S0.mean(axis=1), S1.mean(axis=1)
@@ -329,7 +347,8 @@ def world_response(P: sp.Probe, cand: pd.DataFrame, slack: float = 0.01,
         "district": cand["district"].to_numpy(), "role": cand["role"].to_numpy(),
         "element": cand["element"].to_numpy(),
         "drift_district": tgt, "g": g, "proj": proj, "nu": nu,
-        "excite": excite, "dz_norm": np.linalg.norm(dS, axis=1),
+        "excite": excite, "proj_native": proj_n, "nu_native": nu_n,
+        "excite_native": exc_n, "dz_norm": np.linalg.norm(dS, axis=1),
         "resid": resid,
         "null": split_half_null(P, cand, windows=((lo0, hi0), (lo1, hi1))),
         "null_raw": split_half_null(P, cand),
@@ -451,6 +470,12 @@ def build_mixture(probes: dict, slack: float = 0.01, pad: int = 1,
     NU = gains.pivot(index="id", columns="drift_district", values="nu") \
         .reindex(columns=districts)
     EXC = gains.groupby("drift_district")["excite"].first().reindex(districts)
+    PROJ_N = gains.pivot(index="id", columns="drift_district",
+                         values="proj_native").reindex(columns=districts)
+    NU_N = gains.pivot(index="id", columns="drift_district",
+                       values="nu_native").reindex(columns=districts)
+    EXC_N = gains.groupby("drift_district")["excite_native"].first() \
+        .reindex(districts)
     NULL = gains.groupby("id")["null"].max().reindex(G.index)
     # A gauge whose init-phase series is constant (a pump on a fixed duty, a
     # closed valve) has a null of ~0, and dividing by it produced SNRs of
@@ -461,7 +486,9 @@ def build_mixture(probes: dict, slack: float = 0.01, pad: int = 1,
     NULL = pd.Series(np.maximum(NULL.to_numpy(), floor), index=NULL.index,
                      name="null")
     base = {"degenerate": pd.Series(degenerate, index=NULL.index), "gains": gains,
-            "PROJ": PROJ, "NU": NU, "EXC": EXC, "G": G, "DZ": DZ, "null": NULL,
+            "PROJ": PROJ, "NU": NU, "EXC": EXC,
+            "PROJ_native": PROJ_N, "NU_native": NU_N, "EXC_native": EXC_N,
+            "G": G, "DZ": DZ, "null": NULL,
             "districts": districts, "cand": cand}
     return remix(base, null_factor=null_factor, core_purity=core_purity,
                  foreign_max=foreign_max)
@@ -839,23 +866,36 @@ def zones(res: dict, kind: str = "flow", core_purity: float = 0.85,
 # measured version of it is worth having.
 
 
-def elasticity(base: dict, shrink: bool = True) -> pd.DataFrame:
+def elasticity(base: dict, shrink: bool = True,
+               space: str = "shape") -> pd.DataFrame:
     """E[s,k]: sensor s's response per unit of district k's excitation.
 
+    `space="shape"` works on z-scored weekly profiles: dimensionless, and the
+    part of the response that survives the per-client scaler, so it is the
+    FL-relevant form. `space="native"` works in mca and L/s: the linearised
+    operator itself, dimensioned, and the form that should be invariant to the
+    size of the drift. Report both -- where they disagree, the disagreement is
+    the finding.
+
     Soft-thresholded against the projection noise, so a gauge that did not
-    respond decays to 0 smoothly instead of being cut at a threshold. Set
-    `shrink=False` to get the raw (unbiased but noisy) gains for comparison.
+    respond decays to 0 smoothly instead of being cut at a threshold.
     """
-    Pj, Nu = base["PROJ"].to_numpy(), base["NU"].to_numpy()
-    exc = base["EXC"].to_numpy()[None, :]
+    sfx = "" if space == "shape" else "_native"
+    if f"PROJ{sfx}" not in base:
+        raise KeyError(f"space={space!r} needs a mixture built with the "
+                       "current mixture_probe; rebuild it")
+    Pj, Nu = base[f"PROJ{sfx}"].to_numpy(), base[f"NU{sfx}"].to_numpy()
+    exc = base[f"EXC{sfx}"].to_numpy()[None, :]
     Pt = np.sign(Pj) * np.maximum(np.abs(Pj) - Nu, 0.0) if shrink else Pj
     return pd.DataFrame(Pt / np.where(exc > EPS, exc, np.nan),
-                        index=base["PROJ"].index, columns=base["PROJ"].columns)
+                        index=base[f"PROJ{sfx}"].index,
+                        columns=base[f"PROJ{sfx}"].columns)
 
 
 def dependence(base: dict, kind: str = "flow", top: int | None = None,
                shrink: bool = True, stat: str = "mean",
-               tier: str | None = None, mixture: pd.DataFrame | None = None):
+               tier: str | None = None, mixture: pd.DataFrame | None = None,
+               space: str = "shape"):
     """Observational dependence between districts. Returns (D, R, meta).
 
     `D[j,k]` is district j's mean |elasticity| to district k's drift, in
@@ -868,7 +908,7 @@ def dependence(base: dict, kind: str = "flow", top: int | None = None,
     estimator suffered from. Pass `top` only to ask a placement question
     ("what would the best k gauges see"), never to characterise the network.
     """
-    E = elasticity(base, shrink=shrink)
+    E = elasticity(base, shrink=shrink, space=space)
     cand = base["cand"].set_index("id")
     ds = base["districts"]
     home = cand["district"].reindex(E.index)
@@ -924,7 +964,8 @@ def asymmetry(R: pd.DataFrame) -> pd.DataFrame:
     return (R - R.T).round(3)
 
 
-def estimator_checks(base: dict, kind: str = "flow") -> pd.DataFrame:
+def estimator_checks(base: dict, kind: str = "flow",
+                     space: str = "shape") -> pd.DataFrame:
     """Does the estimator behave the way its derivation says it should?
 
     `noise_pass_rate` -- share of (gauge, district) cells whose projection is
@@ -940,19 +981,20 @@ def estimator_checks(base: dict, kind: str = "flow") -> pd.DataFrame:
     district. This is the honest version of "hit rate": it uses no threshold
     and no tiering.
     """
-    Pj, Nu = base["PROJ"].to_numpy(), base["NU"].to_numpy()
+    sfx = "" if space == "shape" else "_native"
+    Pj, Nu = base[f"PROJ{sfx}"].to_numpy(), base[f"NU{sfx}"].to_numpy()
     cand = base["cand"].set_index("id")
-    keep = (cand["kind"].reindex(base["PROJ"].index) == kind).to_numpy()
+    keep = (cand["kind"].reindex(base[f"PROJ{sfx}"].index) == kind).to_numpy()
     ds = base["districts"]
-    home = cand["district"].reindex(base["PROJ"].index).to_numpy()
+    home = cand["district"].reindex(base[f"PROJ{sfx}"].index).to_numpy()
     hidx = np.array([ds.index(h) if h in ds else -1 for h in home])
 
-    Er = elasticity(base, shrink=False).to_numpy()[keep]
-    Es = elasticity(base, shrink=True).to_numpy()[keep]
+    Er = elasticity(base, shrink=False, space=space).to_numpy()[keep]
+    Es = elasticity(base, shrink=True, space=space).to_numpy()[keep]
     ok = np.isfinite(Er) & np.isfinite(Es)
     big = np.argmax(np.abs(Es), axis=1)
     return pd.DataFrame([{
-        "kind": kind, "n_gauges": int(keep.sum()),
+        "kind": kind, "space": space, "n_gauges": int(keep.sum()),
         "noise_pass_rate": float((np.abs(Pj[keep]) <= Nu[keep]).mean()),
         "shrink_effect_r": float(np.corrcoef(Er[ok].ravel(), Es[ok].ravel())[0, 1]),
         "diag_dominance": float((big == hidx[keep]).mean()),
@@ -962,7 +1004,8 @@ def estimator_checks(base: dict, kind: str = "flow") -> pd.DataFrame:
 
 
 def beta_linearity(base_a: dict, base_b: dict, kind: str = "flow",
-                   label_a: str = "a", label_b: str = "b") -> pd.DataFrame:
+                   label_a: str = "a", label_b: str = "b",
+                   space: str = "shape") -> pd.DataFrame:
     """Is the response operator linear in the excitation?
 
     `E` is already per unit of excitation, so if the network responds linearly
@@ -971,7 +1014,7 @@ def beta_linearity(base_a: dict, base_b: dict, kind: str = "flow",
     a dependence matrix measured at one operating point can be quoted at
     another.
     """
-    Ea, Eb = elasticity(base_a), elasticity(base_b)
+    Ea, Eb = elasticity(base_a, space=space), elasticity(base_b, space=space)
     idx = Ea.index.intersection(Eb.index)
     cand = base_a["cand"].set_index("id")
     idx = idx[(cand["kind"].reindex(idx) == kind).to_numpy()]
@@ -981,7 +1024,8 @@ def beta_linearity(base_a: dict, base_b: dict, kind: str = "flow",
     x, y = x[ok], y[ok]
     slope = float(x @ y / (x @ x)) if len(x) and (x @ x) > EPS else np.nan
     return pd.DataFrame([{
-        "kind": kind, "compare": f"{label_a} vs {label_b}", "n": int(len(x)),
+        "kind": kind, "space": space,
+        "compare": f"{label_a} vs {label_b}", "n": int(len(x)),
         "r": float(np.corrcoef(x, y)[0, 1]) if len(x) > 2 else np.nan,
         "slope": slope,
         "median_ratio": float(np.median(y[np.abs(x) > EPS] / x[np.abs(x) > EPS]))
@@ -991,7 +1035,7 @@ def beta_linearity(base_a: dict, base_b: dict, kind: str = "flow",
 
 def response_matrix(base: dict, kind: str = "flow", top: int | None = 3,
                     tier: str | None = None, mixture: pd.DataFrame | None = None,
-                    normalise: bool = True) -> pd.DataFrame:
+                    normalise: bool = True, space: str = "shape") -> pd.DataFrame:
     """Rows = the district that DRIFTED, columns = where it was measured.
 
     The transpose-orientation counterpart of `dependence`, matching the sweep's
@@ -999,7 +1043,8 @@ def response_matrix(base: dict, kind: str = "flow", top: int | None = 3,
     `normalise=True` each row is divided by its own diagonal, so an entry is
     "this drift showed up at j's meters x as strongly as at its own".
     """
-    D, _, _ = dependence(base, kind=kind, top=top, tier=tier, mixture=mixture)
+    D, _, _ = dependence(base, kind=kind, top=top, tier=tier, mixture=mixture,
+                         space=space)
     M = D.T                                   # rows: drifted, cols: observed
     if normalise:
         diag = pd.Series(np.diag(M.to_numpy()), index=M.index)
