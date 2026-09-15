@@ -365,10 +365,19 @@ def materialize(root, partition_path, base_network: str = "dtown",
     pid = partition_id(districts)
     network = f"{base_network}__{part['method']}__{pid}"
     out = root / "data" / "01_raw" / network
-    if out.exists() and overwrite:
-        shutil.rmtree(out)
+    if out.exists() and not overwrite:
+        raise FileExistsError(f"{out} already exists (overwrite=False)")
     out.mkdir(parents=True, exist_ok=True)
 
+    # Every file this function writes has a name it already knows, so it
+    # overwrites them in place rather than `rmtree`ing the directory first.
+    # A materialised bundle is nothing else's to delete: `out` is named from
+    # a content hash of the partition, so nothing but this function ever
+    # targets it, and an rmtree-then-recreate loop over dozens of partitions
+    # is exactly the delete/write pattern behavioural antivirus (Norton's
+    # IDP.Generic among others) flags as ransomware-shaped. It is also not
+    # crash-safe: a process killed between the rmtree and the writes leaves
+    # an empty directory where a bundle used to be.
     shutil.copy(base["inp"], out / "network.inp")
     (out / "districts.yml").write_text(yaml.safe_dump(
         {"districts": districts, "assets": assets}, sort_keys=False))
@@ -430,9 +439,6 @@ def prepare(root, input_dir, methods=PIPELINE_METHODS, base_network="dtown",
         if part["network"] != base_network:   continue
         if methods is not None and part["method"] not in methods:   continue
 
-        # method = read_partition(f)["method"]
-        # if methods is not None and method not in methods:
-        #     continue
         out.append(materialize(root, f, base_network=base_network,
                                anchor_scale=anchor_scale, verbose=verbose))
     if not out:

@@ -236,7 +236,12 @@ def mixture_browser(result, topo: dict, figsize=(14.5, 11.0), top_bars=20):
                 axes[1][1].text(.5, .5, f"no `{w_use.value}` gauges of this kind",
                                 ha="center", va="center", fontsize=9)
                 axes[1][1].set_axis_off()
-            fig.suptitle(f"{result.config_id}", fontsize=11)
+            ch = pl.channel_diversity(table)
+            v = ch.loc[ch["kind"] == kind, "verdict"]
+            flag = ("  [CHANNEL DEGENERATE — every gauge reports the same blend]"
+                    if len(v) and v.iat[0] != "ok" else "")
+            fig.suptitle(f"{result.config_id}{flag}", fontsize=11,
+                         color=("#c0392b" if flag else "black"))
             plt.tight_layout()
             plt.show()
 

@@ -36,7 +36,6 @@ from __future__ import annotations
 import json
 import math
 import pathlib
-import shutil
 import time as _time
 from dataclasses import dataclass, field
 
@@ -184,6 +183,7 @@ class ConfigResult:
     dependence: dict = field(default_factory=dict)     # kind -> {"D","R","n"}
     response: dict = field(default_factory=dict)       # (kind, use) -> frame
     connectivity: pd.DataFrame = field(default_factory=pd.DataFrame)
+    channels: pd.DataFrame = field(default_factory=pd.DataFrame)
     checks: pd.DataFrame = field(default_factory=pd.DataFrame)
     carriers: pd.DataFrame = field(default_factory=pd.DataFrame)
     carrier_stability: pd.DataFrame = field(default_factory=pd.DataFrame)
@@ -214,6 +214,14 @@ class ConfigResult:
             off = A[~np.eye(len(A), dtype=bool)]
             row[f"{kind}_offdiag"] = round(float(np.nanmean(off)), 4)
             row[f"{kind}_offdiag_max"] = round(float(np.nanmax(off)), 4)
+            # R is a RATIO to the diagonal, not a fraction, so a mean of 1.53
+            # is not "somewhat coupled" -- it says j's meters respond more to
+            # k's drift than to j's own. Counted explicitly because printed
+            # beside 0.05 it reads like a fraction and gets skimmed past.
+            row[f"{kind}_offdiag_gt1"] = int(np.nansum(off > 1.0))
+        for _, r in self.channels.iterrows():
+            row[f"{r['kind']}_channel"] = r["verdict"]
+            row[f"{r['kind']}_tv"] = r["mean_pairwise_tv"]
         if len(self.mixture):
             for tier in ("core", "transition", "foreign", "unusable"):
                 row[f"n_{tier}"] = int((self.mixture["tier"] == tier).sum())
@@ -317,10 +325,22 @@ def run_config(bundle: Bundle, cfg: ls.SweepCfg, root, worlds_root,
     res.checks = pd.concat([mp.estimator_checks(base, k, space=s)
                             for k in ("flow", "pressure")
                             for s in ("shape", "native")], ignore_index=True)
+    # Does each channel carry more than one reading? A channel whose gauges
+    # all report the same simplex row supports no placement decision, however
+    # healthy each gauge looks on its own. Computed here so it lands in
+    # `configs.csv` rather than only at emit time.
+    import placement as _pl
+    res.channels = _pl.channel_diversity(_pl.classification(res))
     res.seconds = _time.time() - t0
     if verbose:
         print(f"  done in {res.seconds/60:.1f} min | "
               + res.mixture.groupby("tier").size().to_dict().__str__())
+        for _, r in res.channels.iterrows():
+            if r["verdict"] != "ok":
+                print(f"  !! {r['kind']} channel DEGENERATE: pairwise tv "
+                      f"{r['mean_pairwise_tv']:.3f}, {r['distinct_rows']} "
+                      f"distinct rows in {r['n_live']} gauges -- dropped from "
+                      "the placement arms")
     return res
 
 
@@ -410,18 +430,35 @@ def elements(results: dict) -> pd.DataFrame:
 # ==========================================================================
 # 3. store
 # ==========================================================================
+_TABLE_NAMES = ("cells", "deltas", "seeds", "horizon", "settle", "diagnostics",
+               "connectivity", "checks", "carrier_stability", "channels",
+               "scores", "mixture", "gains", "stability", "carriers")
+
+
 def persist(res: ConfigResult, out_root) -> pathlib.Path:
-    """Write one configuration's tables. The FL step reads this directory."""
+    """Write one configuration's tables. The FL step reads this directory.
+
+    Overwrites known filenames in place rather than deleting the directory
+    (or a glob within it) first. A rewrite still has to remove a table that
+    THIS run does not produce -- a config that once succeeded and now has
+    fewer live tables should not keep the old one lying around looking
+    current -- so the cleanup stays, but it is now confined to the fixed,
+    named set this function is responsible for, instead of `*.csv`/`*.parquet`
+    or `rmtree`. Two failure modes that pattern had: a glob or `rmtree` here
+    would delete `placements/`, which `placement.emit` writes into the same
+    config folder, and a process killed mid-run left an empty directory where
+    a result used to be rather than the previous, still-valid one.
+    """
     out = pathlib.Path(out_root) / res.config_id
     out.mkdir(parents=True, exist_ok=True)
-    # Clear only what THIS function owns. An earlier version removed the whole
-    # directory, which quietly deleted `placements/` whenever a re-persist
-    # followed a `placement.emit` -- the two write to the same config folder
-    # and only the run order kept them apart.
-    for stale in list(out.glob("*.csv")) + list(out.glob("*.parquet")):
-        stale.unlink()
-    if (out / "matrices").exists():
-        shutil.rmtree(out / "matrices")
+    for name in _TABLE_NAMES:
+        for ext in (".csv", ".parquet"):
+            f = out / f"{name}{ext}"
+            if f.exists():
+                f.unlink()
+    (out / "matrices").mkdir(exist_ok=True)
+    for f in (out / "matrices").glob("*.csv"):
+        f.unlink()
 
     (out / "districts.yml").write_text(yaml.safe_dump(
         {"districts": res.districts, "assets": res.assets}, sort_keys=False))
@@ -437,6 +474,7 @@ def persist(res: ConfigResult, out_root) -> pathlib.Path:
                         ("seeds", res.seeds), ("horizon", res.horizon),
                         ("settle", res.settle), ("diagnostics", res.diagnostics),
                         ("connectivity", res.connectivity), ("checks", res.checks),
+                        ("channels", res.channels),
                         ("carrier_stability", res.carrier_stability)):
         if len(frame):
             frame.to_csv(out / f"{name}.csv", index=False)
@@ -447,7 +485,6 @@ def persist(res: ConfigResult, out_root) -> pathlib.Path:
             frame.to_parquet(out / f"{name}.parquet", index=False)
 
     mat = out / "matrices"
-    mat.mkdir(exist_ok=True)
     for kind, d in res.dependence.items():
         d["D"].to_csv(mat / f"dependence_D_{kind}.csv")
         d["R"].to_csv(mat / f"dependence_R_{kind}.csv")
@@ -476,7 +513,7 @@ def load(path) -> ConfigResult:
                        status=mf.get("status", "ok"), error=mf.get("error", ""),
                        seconds=float(mf.get("seconds", 0.0)))
     for name in ("cells", "deltas", "seeds", "horizon", "settle", "diagnostics",
-                 "connectivity", "checks", "carrier_stability"):
+                 "connectivity", "checks", "carrier_stability", "channels"):
         f = path / f"{name}.csv"
         if f.exists():
             setattr(res, name, pd.read_csv(f))

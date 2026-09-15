@@ -27,7 +27,7 @@ import signal_probe as sp
 __all__ = ["TIER_COLOUR", "district_colours", "draw_base", "district_backdrop",
            "tier_network", "metric_network", "selection_network",
            "mixture_bars", "matrix", "weekly_shapes", "selection_vs_demand",
-           "settle_panel", "cluster_heatmap", "coverage_bars"]
+           "settle_panel", "cluster_heatmap", "coverage_bars", "channel_bars"]
 
 TIER_COLOUR = {"core": "#2e8b57", "transition": "#e08214",
                "foreign": "#c0392b", "unusable": "#c8ccd0"}
@@ -313,4 +313,26 @@ def coverage_bars(ax, cov: pd.DataFrame, arm: str, n_max: int = 5):
     ax.set_xticklabels(labels, rotation=75, fontsize=6)
     ax.set(ylabel="gauges selected", ylim=(0, n_max + 0.6),
            title=f"{arm}: set completeness")
+    return ax
+
+
+def channel_bars(ax, channels: pd.DataFrame, min_tv: float = 0.25):
+    """Mean pairwise mixture distance per channel, against the verdict line.
+
+    The one panel that says whether a channel carries a placement at all. A
+    bar below the line is a channel whose gauges all report the same blend --
+    KY7 pressure sits at 0.05-0.12 against everything else at 0.66-0.78 --
+    so `n_max` gauges from it are one gauge repeated.
+    """
+    d = channels.reset_index(drop=True)
+    labels = [f"{r['kind']}" + (f"\n{r['config_id']}" if "config_id" in d else "")
+              for _, r in d.iterrows()]
+    x = np.arange(len(d))
+    colours = ["#2e8b57" if v == "ok" else "#c0392b" for v in d["verdict"]]
+    ax.bar(x, d["mean_pairwise_tv"], color=colours)
+    ax.axhline(min_tv, color="k", lw=.8, ls="--")
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels, rotation=60, fontsize=6)
+    ax.set(ylabel="mean pairwise mixture distance", ylim=(0, 1),
+           title="channel diversity — below the line is one reading repeated")
     return ax
