@@ -1,0 +1,3 @@
+world_hash,run_key,label,tag,network,districting,placement_source,kinds,classes,n_include,n_exclude,transform,scaling,interval_agg_h,window_size,step_size,reference_months,lstm_units,rounds,fl_seed,sensor_hash,n_windows,seconds,saved_at,status
+c5c8904c3d8c,fe4d4a60301a,fpmp__none__minmax_ref__a3w84s12__u30r5s0,District_A__LR_LR_LR_LR__baseline,ky72,girvan_newman,dynamic,flow+pressure,mixed+pure,0,0,none,minmax_ref,3,84,12,12,30,5,0,2abf702a,1308,20.0,2026-09-16 19:01:47,ok
+c5c8904c3d8c,1dced6f2762d,fmp~b02f4f__none__minmax_ref__a3w84s12__u30r5s0,District_A__LR_LR_LR_LR__baseline,ky72,girvan_newman,dynamic,flow,mixed+pure,0,8,none,minmax_ref,3,84,12,12,30,5,0,1cdad7cc,1308,16.2,2026-09-16 19:09:09,ok

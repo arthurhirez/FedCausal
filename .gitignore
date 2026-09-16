@@ -170,7 +170,7 @@ notebooks/0_prospection/data/
 notebooks/0_prospection/input/
 notebooks/0_prospection/out/
 notebooks/prospection/lab_sandbox/
-
+notebooks/fedwater_lab_refactor/lab_sandbox/runs/
 # EPANET scratch files written to the working directory during runs
 temp.inp
 temp.bin
