@@ -8,6 +8,14 @@ density ordering are gone, replaced by the design invariants the land-use POC
 validated as its ``sanity_suite`` (S1-S15). The S-numbers are quoted in the
 docstrings so the two can be read against each other.
 
+BUNDLES: fixtures read the network bundles under data/01_raw/ with their
+network-scoped parameters RESOLVED from each profile (as network_prep does).
+KY7 is the default network. Three tests stay on Graeme because their premise
+is a GRAVITY network: `partial` coupling must be able to close something
+(KY7's reservoir is pump-fed, so its service check never lets a closure
+through), source flow must equal consumption (KY7's tanks store and release),
+and the pressure band is Graeme's.
+
 Two S-checks are deliberately NOT here. S12 (undrifted baseline is feasible)
 and the hydraulic half of S10/S11 belong to ``sim_validation``, which raises
 in-pipeline; re-asserting them in pytest would only duplicate V1/V2/V3.
@@ -20,6 +28,10 @@ import pytest
 import wntr
 import yaml
 
+from pathlib import Path
+
+from fedwater.config import load_base_params
+from fedwater.networks.profile import resolve_params
 from fedwater.pipelines.demand_synthesis.nodes import (
     apply_drift_ramp,
     sector_day_shape,
@@ -40,28 +52,50 @@ from fedwater.pipelines.urban_scenario.nodes import (
     plot_intensity,
 )
 
-INP = "data/01_raw/Graeme.inp"
-DISTRICTS = "data/01_raw/districts_graeme.yml"
+NETWORK = "ky7"          # the default bundle for these tests
+GRAVITY = "graeme"       # for the three gravity-network premises (see top)
+
+
+def _bundle(name: str) -> dict:
+    root = Path("data/01_raw") / name
+    profile = yaml.safe_load((root / "profile.yml").read_text())
+    params, _ = resolve_params(load_base_params("."), profile)
+    return {"wn": wntr.network.WaterNetworkModel(str(root / "network.inp")),
+            "districts": yaml.safe_load((root / "districts.yml").read_text()),
+            "profile": profile, "params": params}
 
 
 # --------------------------------------------------------------------------
 # fixtures
 # --------------------------------------------------------------------------
 @pytest.fixture(scope="module")
-def params():
-    with open("conf/base/parameters.yml") as fh:
-        return yaml.safe_load(fh)
+def ky7():
+    return _bundle(NETWORK)
 
 
 @pytest.fixture(scope="module")
-def wn():
-    return wntr.network.WaterNetworkModel(INP)
+def gravity():
+    return _bundle(GRAVITY)
 
 
 @pytest.fixture(scope="module")
-def districts():
-    with open(DISTRICTS) as fh:
-        return yaml.safe_load(fh)
+def params(ky7):
+    return ky7["params"]
+
+
+@pytest.fixture(scope="module")
+def profile(ky7):
+    return ky7["profile"]
+
+
+@pytest.fixture(scope="module")
+def wn(ky7):
+    return ky7["wn"]
+
+
+@pytest.fixture(scope="module")
+def districts(ky7):
+    return ky7["districts"]
 
 
 @pytest.fixture(scope="module")
@@ -96,10 +130,10 @@ def portfolios_small(wn, districts, params, landuse_factors, scenario_small):
 
 
 @pytest.fixture(scope="module")
-def timeline_small(wn, districts, params, portfolios_small, landuse_factors,
-                   scenario_small):
+def timeline_small(wn, districts, profile, params, portfolios_small,
+                   landuse_factors, scenario_small):
     factors = build_income_factors(params["buildings"])
-    schedule = build_drift_schedule(wn, districts,
+    schedule = build_drift_schedule(wn, districts, profile,
                                     {**scenario_small, "n_months": 24}, seed=7)
     return evolve_assignments(portfolios_small, schedule, landuse_factors,
                               factors, params["land_use"], scenario_small)
@@ -110,7 +144,7 @@ def timeline_small(wn, districts, params, portfolios_small, landuse_factors,
 # --------------------------------------------------------------------------
 def test_partition_valid(wn, districts):
     report = validate_partition(wn, districts)
-    assert report["n_nodes"].sum() == len(wn.junction_name_list) == 113
+    assert report["n_nodes"].sum() == len(wn.junction_name_list)
 
 
 def test_partition_catches_overlap(wn, districts):
@@ -121,10 +155,12 @@ def test_partition_catches_overlap(wn, districts):
         validate_partition(wn, broken)
 
 
-def test_coupling_partial_preserves_service(wn, districts):
+def test_coupling_partial_preserves_service(gravity):
     """Even at close_fraction=1.0, the partial variant must keep every
-    junction connected to the (single) source — it closes what it can."""
+    junction connected to the (single) source — it closes what it can.
+    (Graeme: on a pump-fed network nothing can close, see module doc.)"""
     import networkx as nx
+    wn, districts = gravity["wn"], gravity["districts"]
     wn_p, boundaries = apply_coupling(
         wn, districts, {"variant": "partial", "close_fraction": 1.0}, seed=42)
     closed = set(boundaries.loc[boundaries["closed"], "pipe"])
@@ -251,10 +287,10 @@ def test_zero_demand_junctions_are_dropped(wn, districts, portfolios_small):
 # --------------------------------------------------------------------------
 # urban_scenario — drift
 # --------------------------------------------------------------------------
-def test_drift_schedule_reproducible_and_bounded(wn, districts, params):
+def test_drift_schedule_reproducible_and_bounded(wn, districts, profile, params):
     scenario = params["scenario"]
-    a = build_drift_schedule(wn, districts, scenario, seed=11)
-    b = build_drift_schedule(wn, districts, scenario, seed=11)
+    a = build_drift_schedule(wn, districts, profile, scenario, seed=11)
+    b = build_drift_schedule(wn, districts, profile, scenario, seed=11)
     pd.testing.assert_frame_equal(a, b)
     tgt_nodes = set(districts["districts"][scenario["drift"]["tgt_district"]])
     assert set(a["node"]) <= tgt_nodes
@@ -262,18 +298,19 @@ def test_drift_schedule_reproducible_and_bounded(wn, districts, params):
     assert set(a["to_land_use"]) == {scenario["drift"]["to_land_use"]}
 
 
-def test_drift_schedule_rejects_zero_warmup(wn, districts, params):
+def test_drift_schedule_rejects_zero_warmup(wn, districts, profile, params):
     """apply_drift_ramp blends against the month BEFORE the switch."""
     scenario = {**params["scenario"],
                 "drift": {**params["scenario"]["drift"], "warmup_months": 0}}
     with pytest.raises(ValueError, match="warmup_months"):
-        build_drift_schedule(wn, districts, scenario, seed=11)
+        build_drift_schedule(wn, districts, profile, scenario, seed=11)
 
 
 def test_evolve_switches_land_use_at_the_drift_month(
-        wn, districts, params, portfolios_small, landuse_factors, scenario_small):
+        wn, districts, profile, params, portfolios_small, landuse_factors,
+        scenario_small):
     factors = build_income_factors(params["buildings"])
-    schedule = build_drift_schedule(wn, districts,
+    schedule = build_drift_schedule(wn, districts, profile,
                                     {**scenario_small, "n_months": 24}, seed=7)
     timeline = evolve_assignments(portfolios_small, schedule, landuse_factors,
                                   factors, params["land_use"], scenario_small)
@@ -426,7 +463,7 @@ def test_weekend_differs_from_weekday(timeline_small, params, small_time):
     assert wk > we
 
 
-def test_seasonality_phase(wn, districts, params, landuse_factors):
+def test_seasonality_phase(wn, districts, profile, params, landuse_factors):
     """Across a full year, the peak month of total volume matches the config.
     Seasonal amplitude is now VOLUME-WEIGHTED across a node's sectors, so this
     also pins that the weighting did not lose the phase."""
@@ -436,8 +473,8 @@ def test_seasonality_phase(wn, districts, params, landuse_factors):
     portfolios = build_portfolios(wn, districts, landuse_factors, factors,
                                   scenario, params["land_use"],
                                   params["hydraulics"])
-    schedule = build_drift_schedule(wn, districts, {**scenario, "n_months": 24},
-                                    seed=5)
+    schedule = build_drift_schedule(wn, districts, profile,
+                                    {**scenario, "n_months": 24}, seed=5)
     timeline = evolve_assignments(portfolios, schedule, landuse_factors,
                                   factors, params["land_use"], scenario)
     # neutralize drift for the phase check: keep only never-drifted nodes
@@ -498,7 +535,7 @@ def _shape_shift(demand, nodes, time, before, after):
 
 @pytest.mark.parametrize("beta", [0.0, 0.5])
 def test_shape_shift_survives_the_scaler_and_is_beta_independent(
-        wn, districts, params, beta):
+        wn, districts, profile, params, beta):
     """S15, the load-bearing claim.
 
     A residential->commercial drift changes the MinMax-scaled weekly profile
@@ -522,8 +559,8 @@ def test_shape_shift_survives_the_scaler_and_is_beta_independent(
     # then keep ONLY the nodes that have actually switched by the month we
     # compare against. Including nodes that drift at months 4-23 would mix an
     # unchanged majority into the aggregate and hide the shift entirely.
-    schedule = build_drift_schedule(wn, districts, {**scenario, "n_months": 24},
-                                    seed=42)
+    schedule = build_drift_schedule(wn, districts, profile,
+                                    {**scenario, "n_months": 24}, seed=42)
     timeline = evolve_assignments(portfolios, schedule, lf, factors,
                                   params["land_use"], scenario)
     patterns = {**params["patterns"], "seasonality_scale": 0.0,
@@ -532,7 +569,7 @@ def test_shape_shift_survives_the_scaler_and_is_beta_independent(
                                 seed=42)
 
     switched = set(schedule.loc[schedule["drift_month"] <= 3, "node"])
-    target = sorted(switched & set(demand.columns), key=int)
+    target = sorted(switched & set(demand.columns))
     assert len(target) >= 3, "fixture no longer drifts enough nodes to measure"
     shift = _shape_shift(demand, target, time, before=0, after=3)
     # print(f"\nshape_shift beta={beta}: {shift:.3f}")
@@ -554,17 +591,22 @@ def test_shape_shift_survives_the_scaler_and_is_beta_independent(
 # --------------------------------------------------------------------------
 # hydraulics — integration (real EPANET, a few simulated days)
 # --------------------------------------------------------------------------
-def test_mass_balance_end_to_end(wn, districts, params, landuse_factors):
+def test_mass_balance_end_to_end(gravity):
+    """Graeme: with no tanks, source outflow must equal consumption."""
+    wn, districts = gravity["wn"], gravity["districts"]
+    profile, params = gravity["profile"], gravity["params"]
+    factors = build_income_factors(params["buildings"])
+    landuse_factors = build_landuse_factors(factors, params["land_use"],
+                                            params["scenario"])
     time = {"n_months": 1, "days_per_month": 2, "resolution_h": 1}
     scenario = {**params["scenario"], "n_months": 1}
-    wn_cfg = configure_network(wn, params["hydraulics"], time)
+    wn_cfg, _ = configure_network(wn, profile, params["hydraulics"], time)
     wn_var, _ = apply_coupling(wn_cfg, districts, {"variant": "baseline"}, seed=1)
 
-    factors = build_income_factors(params["buildings"])
     portfolios = build_portfolios(wn_var, districts, landuse_factors, factors,
                                   scenario, params["land_use"],
                                   params["hydraulics"])
-    schedule = build_drift_schedule(wn_var, districts,
+    schedule = build_drift_schedule(wn_var, districts, profile,
                                     {**scenario, "n_months": 24}, seed=9)
     timeline = evolve_assignments(portfolios, schedule, landuse_factors,
                                   factors, params["land_use"], scenario)

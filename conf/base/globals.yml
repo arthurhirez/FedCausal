@@ -1,0 +1,23 @@
+# =========================================================================
+# Globals: the only values interpolated into catalog paths.
+# conf/local/globals.yml overrides any TOP-LEVEL key whole (the experiments
+# engine writes one per world clone), so `districting` is always written as a
+# complete block.
+# =========================================================================
+
+# The bundle under data/01_raw/.
+network: ky72
+
+districting:
+  # The partition every world is built on: a directory under
+  # data/01_raw/<network>/partitions/.
+  #   manual | spectral | girvan_newman | fast_greedy | walktrap
+  active: spectral
+  # What `kedro run --pipeline districting` builds and compares. Include
+  # `active`. Hyperparameters live in parameters.yml (`districting`).
+  methods: [spectral, girvan_newman, fast_greedy, walktrap]
+
+# Probe stacks (the sensor-placement excitation worlds) are shared across
+# worlds and content-addressed. The experiments engine replaces this with an
+# absolute path so every world clone reads one store.
+probe_store: data/09_experiments/probes

@@ -35,13 +35,65 @@ re-checks it downstream.
 """
 from __future__ import annotations
 
+import re
+
 import numpy as np
 import pandas as pd
 from scipy.special import erf
 
+from fedwater.hashing import stable_hash
 from fedwater.pipelines.urban_scenario.nodes import ANCHOR_DAYS_PER_MONTH
 
 L_PER_M3 = 1000.0
+
+
+# --------------------------------------------------------------------------
+# node identity: names are network-specific, the RNG stream must not be
+# --------------------------------------------------------------------------
+# Graeme names its junctions '1'..'113'; every other network in the corpus
+# uses strings ('J-1' on the KY files, 'J511' on D-Town). Two places assumed
+# the Graeme convention and raised ValueError on the rest:
+#
+#   sorted(nodes, key=int)                -> column order of demand_series
+#   default_rng([seed, month, int(node)]) -> the per-(node, month) RNG key
+#
+# Both are fixed below. Non-numeric names go through the project-wide
+# `stable_hash`, which keeps the "any single node-month is regenerable in
+# isolation" property across processes and machines.
+#
+# THE NUMERIC FAST PATH IS A DELIBERATE EXCEPTION to "one hashing rule
+# everywhere", and the only one in the codebase. An all-numeric name keeps
+# using int(name), so a Graeme run reproduces its previous demand series
+# BIT-FOR-BIT and every Graeme result to date stays comparable. Routing Graeme
+# through stable_hash would be tidier and would re-roll the demand series of
+# the one network the entire existing corpus of results was measured on --
+# a far larger cost than the inconsistency. Graeme is also the ONLY network in
+# the corpus with all-numeric junction names, so no other bundle can silently
+# fall into this branch.
+def _node_rng_key(node: str) -> int:
+    node = str(node)
+    if node.isdigit():
+        return int(node)          # legacy Graeme path -- see note above
+    return stable_hash(node)
+
+
+def _natural_key(node: str):
+    """Split digit runs so 'J-2' sorts before 'J-10', not after."""
+    return tuple(int(part) if part.isdigit() else part
+                 for part in re.split(r"(\d+)", str(node)))
+
+
+def node_order(names) -> list[str]:
+    """Deterministic column order. Numeric on Graeme, natural sort elsewhere.
+
+    Only the column ORDER of ``demand_series`` depends on this — each node's
+    series is generated from its own keyed RNG — so the rule is free to differ
+    per network as long as it is deterministic.
+    """
+    names = [str(n) for n in names]
+    if all(n.isdigit() for n in names):
+        return sorted(names, key=int)
+    return sorted(names, key=_natural_key)
 
 
 def _gauss(t: np.ndarray, mu: float, w: float) -> np.ndarray:
@@ -120,14 +172,14 @@ def synthesize_demands(assignments_timeline: pd.DataFrame, land_use: dict,
     seasonality_scale = float(patterns.get("seasonality_scale", 1.0))
     peak_month = patterns["seasonal_peak_month"]
 
-    nodes = sorted(assignments_timeline["node"].unique(), key=int)
+    nodes = node_order(assignments_timeline["node"].unique())
     col_of = {n: j for j, n in enumerate(nodes)}
     out = np.zeros((n_months * days * steps_day, len(nodes)))
 
     for (month, node), cohorts in assignments_timeline.groupby(["month", "node"]):
         month = int(month)
         # Keyed RNG: any single (node, month) is regenerable in isolation.
-        rng = np.random.default_rng([seed, month, int(node)])
+        rng = np.random.default_rng([seed, month, _node_rng_key(node)])
 
         sector_volume = cohorts.set_index("sector")["sector_volume_m3_month"].sort_index()
         if not np.isfinite(sector_volume.sum()) or sector_volume.sum() <= 0:

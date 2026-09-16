@@ -49,7 +49,13 @@ import pandas as pd
 import yaml
 
 from fedwater.experiments.engine import ExperimentEngine
-from fedwater.experiments.spec import resolve_run, resolve_world, validate_world
+from fedwater.experiments.spec import (
+    bundle,
+    default_network,
+    resolve_run,
+    resolve_world,
+    validate_world,
+)
 
 DISTRICTS = [f"District_{x}" for x in "ABCDE"]
 
@@ -120,8 +126,10 @@ def generate_labeled_worlds(world_specs: pd.DataFrame, fl: dict):
     project = Path.cwd()
     base_params = yaml.safe_load(
         (project / "conf/base/parameters.yml").read_text())
-    districts = yaml.safe_load(
-        (project / "data/01_raw/districts_graeme.yml").read_text())
+    # The factory follows conf/base/globals.yml like everything else; it does
+    # not sweep the network axis.
+    network = default_network(project)
+    districts = bundle(project, network)["districts"]
     engine = ExperimentEngine(project, root=Path(cfg["scratch_dir"]))
     run = resolve_run({"step_size": cfg["step_size"], "batch_size": 128,
                        "rounds": cfg["fl_rounds"],
@@ -130,7 +138,8 @@ def generate_labeled_worlds(world_specs: pd.DataFrame, fl: dict):
 
     pairs, clients = [], []
     for spec in world_specs.itertuples(index=False):
-        world = resolve_world(_world_raw(spec, cfg), base_params)
+        world = resolve_world(_world_raw(spec, cfg), base_params,
+                              network, len(districts["districts"]))
         # Validate BEFORE simulating: a no-op drift (target income and land
         # use both equal to the district's initial state) would otherwise
         # simulate a world with nothing to detect and then fail the
