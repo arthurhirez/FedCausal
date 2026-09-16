@@ -190,20 +190,24 @@ def stack_spec(*, network: str, partition: dict, world: dict, probe: dict,
         "hydraulics": world["hydraulics"],
         "land_use": world["land_use"],
         "buildings": world["buildings"],
+        # the probe's actual time grid and schedule: the plan decided them,
+        # from the world or from the probe block, per the mode switches
         "patterns": {**world["patterns"],
-                     "drift_ramp_days": int(probe["drift_ramp_days"]),
-                     "seasonality_scale": float(probe["seasonality_scale"])},
+                     "drift_ramp_days": int(plan["drift_ramp_days"]),
+                     "seasonality_scale": float(plan["seasonality_scale"])},
         "time": {**world["time"], "n_months": int(plan["n_months"]),
-                 "days_per_month": int(probe["days_per_month"])},
+                 "days_per_month": int(plan["days_per_month"])},
         "coupling": coupling,
         "seed": int(seed),
-        "probe": {k: probe[k] for k in (
-            "transitions", "warmup_months", "growth_chance", "settle",
-            "battery_max_lag_h", "top_carriers")},
-        "plan": {"n_months": plan["n_months"],
-                 "max_neighbors_per_month": plan["max_neighbors_per_month"],
-                 "seeds": dict(zip(plan["seeds"]["district"],
-                                   plan["seeds"]["seed_node"]))},
+        "probe": {**{k: probe[k] for k in (
+            "transitions", "settle", "battery_max_lag_h", "top_carriers")},
+            **plan["modes"]},
+        "plan": {k: plan[k] for k in (
+            "n_months", "days_per_month", "warmup_months", "drift_ramp_days",
+            "seasonality_scale", "season_aligned", "growth_chance",
+            "max_neighbors_per_month")}
+        | {"seeds": dict(zip(plan["seeds"]["district"],
+                             plan["seeds"]["seed_node"]))},
         "analysis": {k: classes[k] for k in (
             "null_factor", "null_factors", "core_purity", "foreign_max")},
     }
@@ -301,8 +305,15 @@ def _purity_stability(base: dict, factors, core_purity: float,
 
 
 def analyze(stack: ProbeStack, probes: dict, beta: float, classes: dict,
-            probe: dict, verbose: bool = True) -> ProbeStack:
-    """Every quantity the POC measured, over one stack's K worlds."""
+            probe: dict, verbose: bool = True,
+            season_aligned: bool = False) -> ProbeStack:
+    """Every quantity the POC measured, over one stack's K worlds.
+
+    ``season_aligned``: the probes carry seasonality, so the horizon check
+    and the mixture use whole-year windows (``mixture_probe.season_windows``).
+    The resemblance battery and the settle report keep their phase windows;
+    both are descriptive, and neither feeds the gain matrix.
+    """
     settle = probe["settle"]
     kw = dict(ref_months=int(settle["ref_months"]), slack=float(settle["slack"]),
               pad=int(settle["pad"]))
@@ -337,7 +348,7 @@ def analyze(stack: ProbeStack, probes: dict, beta: float, classes: dict,
 
     # -- settling (POC §2b) ------------------------------------------------
     stack.horizon = mp.horizon_check(probes, min_months=int(settle["min_months"]),
-                                     **kw)
+                                     season_aligned=season_aligned, **kw)
     if not stack.horizon["ok"].all():
         short = list(stack.horizon.loc[~stack.horizon["ok"], "drift_district"])
         raise ValueError(
@@ -352,7 +363,8 @@ def analyze(stack: ProbeStack, probes: dict, beta: float, classes: dict,
 
     # -- the mixture (POC §2c) -------------------------------------------------
     base = mp.build_mixture(probes, null_factor=null_factor, core_purity=core,
-                            foreign_max=foreign, verbose=verbose, **kw)
+                            foreign_max=foreign, verbose=verbose,
+                            season_aligned=season_aligned, **kw)
     stack.base = base
     stack.mixture = base["mixture"]
     stack.gains = base["gains"]
@@ -531,8 +543,9 @@ def ensure_stack(*, store_root, spec: dict, inputs: dict, world: dict,
                 ex = excite.excitation(regimes[d], transitions)
                 print(f"probe stack {network}/{method}/{h}: {d} "
                       f"{regimes[d][1]} -> {ex['to_land_use']} "
-                      f"({plan['n_months']} x {probe['days_per_month']} d)",
-                      flush=True)
+                      f"({plan['n_months']} x {plan['days_per_month']} d, "
+                      f"warm-up {plan['warmup_months']}, seasonality "
+                      f"{plan['seasonality_scale']})", flush=True)
             params = excite.probe_params(world, probe, plan, d, regimes[d],
                                          transitions, coupling, seed)
             w = excite.simulate_probe(inputs, params,
@@ -541,7 +554,8 @@ def ensure_stack(*, store_root, spec: dict, inputs: dict, world: dict,
                 _save_world(w, path / "worlds" / d)
             probes[d] = sp.Probe.from_world(w)
         analyze(stack, probes, beta=float(world["scenario"]["beta"]),
-                classes=classes, probe=probe, verbose=verbose)
+                classes=classes, probe=probe, verbose=verbose,
+                season_aligned=bool(plan["season_aligned"]))
         stack.probes = probes
         stack.seconds = _time.time() - t0
         _persist_tables(stack, path)

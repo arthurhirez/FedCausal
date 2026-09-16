@@ -49,29 +49,39 @@ def verify_placement(placement: pd.DataFrame, pressures: pd.DataFrame,
         "district": placement["district"].to_numpy(),
         "role": placement["role"].fillna("").to_numpy(),
         "element": placement["element"].astype(str).to_numpy()})
-    # The settle scan follows the drifting district's AGGREGATE profile, which
-    # can flip early (the seed is the district's largest consumer) while the
-    # front is still converting nodes. The window therefore starts at the
-    # later of the settle month and the drift's completion.
     n, sm = int(time["n_months"]), P.steps_month
     final0 = int(P.phases()["final"][0])
-    try:
-        s_lo, _ = mp.settled_window(P, ref_months=int(settle["ref_months"]),
-                                    slack=float(settle["slack"]),
-                                    pad=int(settle["pad"]), min_months=0)
-        start = max(s_lo // sm, final0)
-    except ValueError:
-        start = final0
     need = int(settle.get("min_months", 3))
-    if n - start < need:
-        out["status"] = (f"unsettled: {n - start} settled month(s) after the "
-                         f"drift completes (month {final0}), {need} needed; "
-                         "the world horizon is too short to verify")
-        return out
+    if float((patterns or {}).get("seasonality_scale", 0.0)) > 0:
+        # seasonality on: whole-year windows on both sides, as the stacks use
+        try:
+            base, window = mp.season_windows(P, pad=int(settle["pad"]))
+        except ValueError as exc:
+            out["status"] = f"unsettled: {exc}"[:300]
+            return out
+    else:
+        # The settle scan follows the drifting district's AGGREGATE profile,
+        # which can flip early (the seed is the district's largest consumer)
+        # while the front is still converting nodes. The window therefore
+        # starts at the later of the settle month and the drift's completion.
+        try:
+            s_lo, _ = mp.settled_window(
+                P, ref_months=int(settle["ref_months"]),
+                slack=float(settle["slack"]), pad=int(settle["pad"]),
+                min_months=0)
+            start = max(s_lo // sm, final0)
+        except ValueError:
+            start = final0
+        if n - start < need:
+            out["status"] = (f"unsettled: {n - start} settled month(s) after "
+                             f"the drift completes (month {final0}), {need} "
+                             "needed; the world horizon is too short to verify")
+            return out
+        base, window = None, (start * sm, n * sm)
     r = mp.world_response(P, cand, slack=float(settle["slack"]),
                           pad=int(settle["pad"]),
                           ref_months=int(settle["ref_months"]),
-                          window=(start * sm, n * sm))
+                          window=window, baseline=base)
 
     r = r.set_index("id").reindex(out["sensor"])
     out["observed_g"] = r["g"].to_numpy()

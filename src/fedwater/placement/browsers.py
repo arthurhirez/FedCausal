@@ -193,7 +193,7 @@ def mixture_browser(result, topo: dict, figsize=(14.5, 11.0), top_bars=20):
     w_use = W.ToggleButtons(options=uses,
                             value="all" if "all" in uses else uses[0],
                             description="gauges")
-    w_top = W.IntSlider(value=top_bars, min=5, max=60, step=5,
+    w_top = W.IntSlider(value=top_bars, min=5, max=100, step=5,
                         description="bars", continuous_update=False,
                         layout=W.Layout(width="380px"))
     w_unu = W.Checkbox(value=True, description="show unusable")

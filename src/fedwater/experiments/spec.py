@@ -234,6 +234,9 @@ def expand_axes(section) -> list[dict]:
 # --------------------------------------------------------------------------
 # resolution — spec + base params -> full-block override + effective config
 # --------------------------------------------------------------------------
+STORE_REF = "${globals:probe_store}"
+
+
 def resolve_world(world: dict, base_params: dict, network: str,
                   n_districts: int, profile: dict | None = None,
                   partition: dict | None = None) -> dict:
@@ -295,13 +298,36 @@ def resolve_world(world: dict, base_params: dict, network: str,
                      **(world.get("coupling") or {})},
         "scenario": scenario,
     }
+    # time grid and demand-pattern keys a study may set directly (they also
+    # reach the probes when sensor_placement.probe.horizon / seasonality is
+    # `world`)
+    if "days_per_month" in world:
+        override["time"]["days_per_month"] = int(world["days_per_month"])
+    patterns_patch = {k: world[k] for k in ("seasonality_scale",
+                                            "drift_ramp_days") if k in world}
+    if patterns_patch:
+        override["patterns"] = _deep_merge(base["patterns"], patterns_patch)
     if world.get("oracle"):
         override["oracle"] = _deep_merge(base["oracle"], world["oracle"])
+    # `placement` is the sensor_placement block's shorthand
+    if world.get("placement"):
+        override["sensor_placement"] = _deep_merge(
+            base["sensor_placement"], world["placement"])
     for key, patch in (world.get("sim_overrides") or {}).items():
         if key == "fl":
             raise ValueError("sim_overrides cannot touch 'fl' (run-level).")
-        override[key] = _deep_merge(base.get(key, {}), patch) \
+        if key == "districting":
+            raise ValueError("sim_overrides cannot touch 'districting': the "
+                             "partition is chosen with the `districting` axis "
+                             "and configured in parameters.yml.")
+        override[key] = _deep_merge(override.get(key, base.get(key, {})),
+                                    patch) \
             if isinstance(patch, dict) else copy.deepcopy(patch)
+    if "sensor_placement" in override:
+        # base was read with ${globals:...} RESOLVED; written back literally,
+        # the clone would store probe stacks under its own relative path
+        # instead of the engine's shared store.
+        override["sensor_placement"]["store"] = STORE_REF
 
     effective = {k: v for k, v in base.items() if k != "fl"}
     effective = {**effective, **override}
@@ -358,6 +384,13 @@ def resolve_world(world: dict, base_params: dict, network: str,
         "partition_id": partition.get("partition_id"),
         "placement_source": source,
         "slots_pressure": per_district.get("pressure", 0),
+        "days_per_month": int(effective["time"]["days_per_month"]),
+        "seasonality_scale": float(effective["patterns"].get(
+            "seasonality_scale", 1.0)),
+        "probe_horizon": (placement.get("probe") or {}).get("horizon",
+                                                            "planned"),
+        "probe_seasonality": (placement.get("probe") or {}).get("seasonality",
+                                                                "none"),
         "slots_flow": per_district.get("flow", 0),
         "n_pressure_sensors": (
             sum(len(c.get("pressure", [])) for c in manual_sensors.values())
@@ -490,6 +523,21 @@ def validate_placement(eff: dict) -> None:
                 or int(v.get("pure", 0)) + int(v.get("mixed", 0)) == 0:
             raise ValueError(f"sensor_placement.slots.{kind} needs a "
                              f"non-negative, non-zero pure + mixed, got {v}.")
+    from fedwater.placement.excite import probe_modes
+    from fedwater.placement.mixture_probe import SEASON_MONTHS
+    modes = probe_modes(sp.get("probe") or {})
+    seasonal = (modes["seasonality"] == "world"
+                and float(eff["patterns"].get("seasonality_scale", 1.0)) > 0)
+    if seasonal:
+        warmup = (int(eff["scenario"]["drift"]["warmup_months"])
+                  if modes["horizon"] == "world"
+                  else int(sp["probe"]["warmup_months"]))
+        if warmup < SEASON_MONTHS:
+            raise ValueError(
+                "sensor_placement.probe.seasonality is `world` and the world "
+                f"has seasonality, but the probe warm-up is {warmup} month(s): "
+                f"whole-year windows need >= {SEASON_MONTHS} (raise "
+                "drift.warmup_months, or set probe.seasonality: none).")
     ref = (sp.get("selection_coupling") or {}).get("variant")
     if ref not in ("baseline", "isolated"):
         raise ValueError("sensor_placement.selection_coupling.variant must be "

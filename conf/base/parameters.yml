@@ -408,17 +408,43 @@ sensor_placement:
       mixed: industrial
       commercial: industrial
       industrial: residential
+
+    # ---- which time grid the probes run on --------------------------------
+    # horizon:     planned | world
+    #   world   -> n_months, days_per_month, warmup_months, drift_ramp_days
+    #              are the TARGET world's (labels and world on one grid)
+    #   planned -> the `planned grid` keys below, sized to the partition
+    # seasonality: none | world
+    #   world   -> probes carry the world's patterns.seasonality_scale, and the
+    #              mixture is measured on whole-year windows: needs a warm-up
+    #              of >= 12 months and >= 12 settled months
+    # diffusion:   planned | world
+    #   planned -> front width derived so the LARGEST district converts and
+    #              settles inside the horizon (growth_chance below)
+    #   world   -> the world's growth_chance / max_neighbors_per_month;
+    #              refused up front if the largest district cannot settle
+    # Defaults keep the planned grid: the base world (warm-up 2, seasonality
+    # on) cannot satisfy the whole-year rule. Studies that want one ground for
+    # world and probes set `placement: {probe: {horizon: world, seasonality:
+    # world}}` (see experiments.yml).
+    horizon: planned
+    seasonality: none
+    diffusion: planned
+    growth_chance: 1.0       # diffusion: planned
+
+    # planned grid (horizon: planned only)
+    days_per_month: 14
+    warmup_months: 8
+    drift_ramp_days: 7
+    n_months: auto           # auto = what horizon_plan says the partition needs
+    convert_months: 12       # target conversion time for the largest district
+    max_neighbors_per_month: auto
+    # settled months the mixture needs when seasonality is off (with it on,
+    # the rule is one whole year)
+    settled_months: 8
+
     seed: 42                 # probe demand draws (closures never depend on
                              # it: label stacks close an explicit pipe set)
-    days_per_month: 14       # probe horizon -- NOT the world's
-    warmup_months: 8
-    convert_months: 12       # target conversion time for the largest district
-    settled_months: 8        # post-ramp months the settled window needs
-    n_months: auto           # auto = what horizon_plan says the partition needs
-    max_neighbors_per_month: auto
-    drift_ramp_days: 7
-    growth_chance: 1.0
-    seasonality_scale: 0.0   # probes isolate the land-use signature
     settle: {ref_months: 3, slack: 0.01, pad: 1, min_months: 3}
     battery_max_lag_h: 6.0
     top_carriers: 5

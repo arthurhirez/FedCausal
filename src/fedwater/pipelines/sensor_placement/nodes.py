@@ -91,7 +91,7 @@ def ensure_probe_stacks(wn, network_profile: dict, districts: dict,
     world = {"hydraulics": hydraulics, "scenario": scenario,
              "validation": validation, "time": time, "land_use": land_use,
              "buildings": buildings, "patterns": patterns}
-    plan = excite.horizon_plan(wn, districts, partition_meta, probe)
+    plan = excite.horizon_plan(wn, districts, partition_meta, probe, world)
     inputs = {"network_inp": wn, "network_profile": network_profile,
               "districts": districts, "partition_manifest": partition_manifest}
     root = Path(sensor_placement["store"]).expanduser().resolve()
@@ -119,8 +119,10 @@ def ensure_probe_stacks(wn, network_profile: dict, districts: dict,
     pointer["same_stack"] = (pointer["selection"]["stack_hash"]
                              == pointer["label"]["stack_hash"])
     pointer["plan"] = {k: plan[k] for k in (
-        "n_months", "need_n_months", "max_neighbors_per_month",
-        "convert_months", "largest_district", "max_eccentricity")}
+        "n_months", "need_n_months", "days_per_month", "warmup_months",
+        "drift_ramp_days", "seasonality_scale", "season_aligned",
+        "growth_chance", "max_neighbors_per_month", "convert_months",
+        "largest_district", "max_eccentricity")} | {"modes": plan["modes"]}
     return pointer
 
 

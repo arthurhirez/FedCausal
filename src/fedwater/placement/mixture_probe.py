@@ -54,7 +54,8 @@ import pandas as pd
 
 from . import signal_probe as sp
 
-__all__ = ["settle_scan", "settle_month", "settle_report", "settled_window",
+__all__ = ["SEASON_MONTHS", "season_windows",
+           "settle_scan", "settle_month", "settle_report", "settled_window",
            "split_half_null", "horizon_check",
            "world_response", "build_mixture", "remix", "classify", "mixture_diagnostics",
            "tier_sensitivity", "purity_histogram", "dependence_matrix",
@@ -208,6 +209,43 @@ def baseline_window(P: sp.Probe) -> tuple[int, int]:
     return P.month_slice("init")
 
 
+# demand_synthesis: v_month *= 1 + amp * cos(2*pi*(month % 12 - peak) / 12)
+SEASON_MONTHS = 12
+
+
+def season_windows(P: sp.Probe, pad: int = 1,
+                   period: int = SEASON_MONTHS) -> tuple[tuple, tuple]:
+    """(baseline, settled) windows in steps, each a WHOLE number of seasons.
+
+    With seasonality on, the monthly volume follows a 12-month cosine whose
+    amplitude depends on the sector mix, and pressure/flow respond to it
+    non-linearly. A baseline window in one season and a settled window in
+    another would hand every gauge a common-mode "response" that no
+    district's land use caused. Covering whole cycles on both sides makes the
+    seasonal average identical in the two weekly profiles, so it cancels in
+    the difference.
+
+    The settled window starts at the SCHEDULE's final phase (last switch +
+    ramp) plus ``pad``, not at the settle scan: the scan compares each month
+    with the terminal months, and a seasonal cycle keeps those different by
+    construction. After the last ramp the demand regime is fixed, so the
+    schedule is the honest bound.
+    """
+    n = int(P.time["n_months"])
+    init_hi = int(P.phases()["init"][1])
+    start = int(P.phases()["final"][0]) + int(pad)
+    k0, k1 = init_hi // period, (n - start) // period
+    if k0 < 1 or k1 < 1:
+        raise ValueError(
+            f"season-aligned windows need >= {period} drift-free months before "
+            f"the first switch (have {init_hi}) and >= {period} settled months "
+            f"after month {start} (have {n - start}); raise warmup_months / "
+            "n_months, or turn seasonality off")
+    sm = P.steps_month
+    return (((init_hi - k0 * period) * sm, init_hi * sm),
+            ((n - k1 * period) * sm, n * sm))
+
+
 # ==========================================================================
 # 2. one world -> response vectors
 # ==========================================================================
@@ -226,14 +264,16 @@ def _profile(P: sp.Probe, cand: pd.DataFrame, lo: int, hi: int):
 
 def _split_half_delta(P: sp.Probe, cand: pd.DataFrame,
                       windows: tuple | None = None,
-                      space: str = "shape") -> np.ndarray:
+                      space: str = "shape",
+                      base: tuple | None = None) -> np.ndarray:
     """The split-half difference VECTOR, scaled like the measurement.
 
     `split_half_null` returns its norm; the projection-based estimator needs
     the vector itself so the noise can be projected onto the same direction as
-    the signal.
+    the signal. ``base`` overrides the window that is split (season-aligned
+    estimation passes its whole-year baseline).
     """
-    lo, hi = baseline_window(P)
+    lo, hi = base if base is not None else baseline_window(P)
     sd = P.steps_day
     mid = lo + ((hi - lo) // (2 * sd)) * sd
     A, _, _ = _profile(P, cand, lo, mid)
@@ -249,7 +289,8 @@ def _split_half_delta(P: sp.Probe, cand: pd.DataFrame,
 
 
 def split_half_null(P: sp.Probe, cand: pd.DataFrame,
-                    windows: tuple | None = None) -> np.ndarray:
+                    windows: tuple | None = None,
+                    base: tuple | None = None) -> np.ndarray:
     """Per-sensor noise floor for ||dz||, from two halves of the init phase.
 
     Nothing drifts during `init`, so whatever `||dz||` comes out of splitting
@@ -265,8 +306,12 @@ def split_half_null(P: sp.Probe, cand: pd.DataFrame,
     because the null was estimated on less data than the signal. `windows`
     carries the two windows actually being compared; the null is rescaled by
     sqrt((1/n_a + 1/n_b) / (2/n_half)) in days.
+
+    With seasonality on, the two halves of a one-year baseline sit in
+    different seasons, so the null also carries seasonal shape and is
+    CONSERVATIVE: fewer gauges clear it.
     """
-    lo, hi = baseline_window(P)
+    lo, hi = base if base is not None else baseline_window(P)
     sd = P.steps_day
     mid = lo + ((hi - lo) // (2 * sd)) * sd
     A, _, _ = _profile(P, cand, lo, mid)
@@ -284,20 +329,20 @@ def split_half_null(P: sp.Probe, cand: pd.DataFrame,
 
 def world_response(P: sp.Probe, cand: pd.DataFrame, slack: float = 0.01,
                    pad: int = 1, ref_months: int = 3,
-                   window: tuple[int, int] | None = None) -> pd.DataFrame:
+                   window: tuple[int, int] | None = None,
+                   baseline: tuple[int, int] | None = None) -> pd.DataFrame:
     """One world -> one column of the gain matrix.
 
     Returns per sensor: the regression coefficient of its shape change on the
     drifting district's demand shape change, the residual left over, and the
     same quantities for level so the two can be told apart.
 
-    ``window`` (steps) overrides the settled window; the estimator is
-    unchanged. ``placement.verify`` uses it on target worlds, whose slow
-    diffusion can make the settle scan report a month before the drift has
-    finished.
+    ``window`` / ``baseline`` (steps) override the settled and baseline
+    windows; the estimator is unchanged. ``season_windows`` supplies both when
+    seasonality is on; ``placement.verify`` supplies them on target worlds.
     """
     tgt = P.drift["tgt_district"]
-    lo0, hi0 = baseline_window(P)
+    lo0, hi0 = baseline if baseline is not None else baseline_window(P)
     lo1, hi1 = window if window is not None else settled_window(
         P, ref_months=ref_months, slack=slack, pad=pad)
 
@@ -320,7 +365,8 @@ def world_response(P: sp.Probe, cand: pd.DataFrame, slack: float = 0.01,
     # projection averages the noise over the profile instead of accumulating
     # it. Using the norm-null to gate a projection is what forced `null_factor`
     # so high that mixtures collapsed to one-hot.
-    dN = _split_half_delta(P, cand, windows=((lo0, hi0), (lo1, hi1)))
+    dN = _split_half_delta(P, cand, windows=((lo0, hi0), (lo1, hi1)),
+                           base=(lo0, hi0))
     nu = np.abs(dN @ u)
 
     # The SAME estimator in native units (mca, L/s), not on z-scored profiles.
@@ -337,7 +383,7 @@ def world_response(P: sp.Probe, cand: pd.DataFrame, slack: float = 0.01,
     un = dDn / exc_n if exc_n > EPS else dDn * 0.0
     proj_n = dSn @ un
     dNn = _split_half_delta(P, cand, windows=((lo0, hi0), (lo1, hi1)),
-                            space="native")
+                            space="native", base=(lo0, hi0))
     nu_n = np.abs(dNn @ un)
 
     # level, kept separate on purpose: a gauge can move a lot in volume and
@@ -355,8 +401,9 @@ def world_response(P: sp.Probe, cand: pd.DataFrame, slack: float = 0.01,
         "excite": excite, "proj_native": proj_n, "nu_native": nu_n,
         "excite_native": exc_n, "dz_norm": np.linalg.norm(dS, axis=1),
         "resid": resid,
-        "null": split_half_null(P, cand, windows=((lo0, hi0), (lo1, hi1))),
-        "null_raw": split_half_null(P, cand),
+        "null": split_half_null(P, cand, windows=((lo0, hi0), (lo1, hi1)),
+                                base=(lo0, hi0)),
+        "null_raw": split_half_null(P, cand, base=(lo0, hi0)),
         "d_level": dlv, "d_level_district": dD_lvl,
         "settle_start_month": lo1 // P.steps_month,
     })
@@ -366,7 +413,8 @@ def world_response(P: sp.Probe, cand: pd.DataFrame, slack: float = 0.01,
 # 3. stack the worlds -> mixture
 # ==========================================================================
 def horizon_check(probes: dict, ref_months: int = 3, slack: float = 0.01,
-                 pad: int = 1, min_months: int = 3) -> pd.DataFrame:
+                 pad: int = 1, min_months: int = 3,
+                 season_aligned: bool = False) -> pd.DataFrame:
     """Pre-flight: does every world have a long enough SETTLED stretch?
 
     Run this before `build_mixture`. A world whose settled window is short
@@ -375,6 +423,27 @@ def horizon_check(probes: dict, ref_months: int = 3, slack: float = 0.01,
     says how many months each world would need.
     """
     rows = []
+    if season_aligned:
+        for d, P in probes.items():
+            n = int(P.time["n_months"])
+            init_hi = int(P.phases()["init"][1])
+            start = int(P.phases()["final"][0]) + int(pad)
+            rows.append({"drift_district": d, "n_months": n,
+                         "last_switch": (int(P.schedule["drift_month"].max())
+                                         if len(P.schedule) else None),
+                         "settle_month": start - int(pad),
+                         "settled_from": start, "settled_months": n - start,
+                         "baseline_months": init_hi,
+                         "ok": ((n - start) >= SEASON_MONTHS
+                                and init_hi >= SEASON_MONTHS),
+                         "need_n_months": start + SEASON_MONTHS})
+        d = pd.DataFrame(rows)
+        if not d["ok"].all():
+            print("HORIZON TOO SHORT (season-aligned) for "
+                  f"{list(d.loc[~d['ok'], 'drift_district'])}: needs "
+                  f"n_months >= {int(d['need_n_months'].max())} and a "
+                  f"{SEASON_MONTHS}-month warm-up")
+        return d
     for d, P in probes.items():
         n = int(P.time["n_months"])
         sm = settle_month(P, ref_months, slack)
@@ -400,8 +469,11 @@ def horizon_check(probes: dict, ref_months: int = 3, slack: float = 0.01,
 def build_mixture(probes: dict, slack: float = 0.01, pad: int = 1,
                   ref_months: int = 3, null_factor: float = 3.0,
                   core_purity: float = 0.85, foreign_max: float = 0.15,
-                  verbose: bool = True) -> dict:
+                  verbose: bool = True, season_aligned: bool = False) -> dict:
     """Stack one world per drifting district -> the mixture table.
+
+    ``season_aligned`` measures every world on whole-year windows
+    (:func:`season_windows`); use it whenever the worlds carry seasonality.
 
     `probes` is {drifting district: Probe}. Every world must share the
     network, the initial map and the seed, so their `init` phases are the same
@@ -439,8 +511,12 @@ def build_mixture(probes: dict, slack: float = 0.01, pad: int = 1,
     frames = []
     for d in districts:
         P = probes[d]
+        kw = {}
+        if season_aligned:
+            b, w = season_windows(P, pad=pad)
+            kw = {"baseline": b, "window": w}
         frames.append(world_response(P, cand, slack=slack, pad=pad,
-                                     ref_months=ref_months))
+                                     ref_months=ref_months, **kw))
         if verbose:
             print(f"  {d}: settled from month "
                   f"{int(frames[-1]['settle_start_month'].iat[0])}", flush=True)

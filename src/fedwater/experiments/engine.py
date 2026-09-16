@@ -271,9 +271,47 @@ class ExperimentEngine:
         return out
 
     def prepare_study(self, name: str) -> dict:
-        """Build the partitions a study needs, then expand it."""
+        """Build the partitions a study needs, expand it, and check that every
+        dynamic world's probe schedule fits its horizon."""
         self.ensure_partitions(study_partitions(name, self.project))
-        return expand_study(name, self.project)
+        study_def = expand_study(name, self.project)
+        self.preflight_placement(study_def)
+        return study_def
+
+    def preflight_placement(self, study_def: dict) -> None:
+        """Plan every dynamic world's probe schedule before anything runs.
+
+        ``excite.horizon_plan`` is pure planning (graph distances, no
+        hydraulics), so a horizon that cannot convert and settle a partition --
+        seed eccentricity, whole-year windows, the world's own front -- is
+        reported for the whole study up front instead of failing world by
+        world after their simulations.
+        """
+        import wntr
+
+        from fedwater.placement import excite
+        from .spec import bundle
+
+        models, problems = {}, []
+        for w in study_def["worlds"]:
+            eff = w["effective"]
+            sp = eff.get("sensor_placement") or {}
+            if sp.get("source", "dynamic") != "dynamic":
+                continue
+            network, method = w["network"], w["flat"]["districting"]
+            if network not in models:
+                models[network] = wntr.network.WaterNetworkModel(
+                    str(pstore.bundle_dir(self.project, network) / "network.inp"))
+            b = bundle(self.project, network, method)
+            world = {k: eff[k] for k in ("time", "scenario", "patterns")}
+            try:
+                excite.horizon_plan(models[network], b["districts"],
+                                    b["partition"], sp["probe"], world)
+            except ValueError as exc:
+                problems.append(f"  {w['sim_hash']} {network}/{method}: {exc}")
+        if problems:
+            raise ValueError("probe schedule does not fit for "
+                             f"{len(problems)} world(s):\n" + "\n".join(problems))
 
     # -- worlds --------------------------------------------------------------
     def ensure_world(self, world: dict) -> dict:

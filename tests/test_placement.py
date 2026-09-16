@@ -550,3 +550,195 @@ def test_probe_stack_builds_caches_and_reloads(tmp_path, built_partitions):
         store.load_stack(path)
     ensure_probe_stacks(*args)
     assert store.load_stack(path).status == "ok"
+
+
+# ==========================================================================
+# one ground for world and probes: horizon / seasonality / diffusion modes
+# ==========================================================================
+def _world_blocks(n_months=50, dpm=30, warmup=12, seasonality=1.0, ramp=42):
+    from fedwater.networks.profile import resolve_params
+    resolved, _ = resolve_params(BASE, _bundle_files()["profile"])
+    w = {k: copy.deepcopy(resolved[k]) for k in (
+        "hydraulics", "scenario", "validation", "time", "land_use",
+        "buildings", "patterns")}
+    w["time"].update(n_months=n_months, days_per_month=dpm)
+    w["scenario"]["n_months"] = n_months
+    w["scenario"]["drift"]["warmup_months"] = warmup
+    w["patterns"].update(seasonality_scale=seasonality, drift_ramp_days=ramp)
+    return w
+
+
+def _probe(**modes):
+    p = copy.deepcopy(BASE["sensor_placement"]["probe"])
+    p.update(modes)
+    return p
+
+
+@pytest.fixture(scope="module")
+def manual_part(built_partitions):
+    part = pstore.read_partition(ROOT, NETWORK, "manual")
+    meta = pstore.partition_meta(part["manifest"], _bundle_files()["profile"])
+    return part, meta
+
+
+def test_world_horizon_puts_probes_on_the_world_grid(wn, manual_part):
+    part, meta = manual_part
+    world = _world_blocks()
+    plan = excite.horizon_plan(wn, part["districts"], meta,
+                               _probe(horizon="world", seasonality="world"),
+                               world)
+    assert (plan["n_months"], plan["days_per_month"], plan["warmup_months"],
+            plan["drift_ramp_days"]) == (50, 30, 12, 42)
+    assert plan["seasonality_scale"] == 1.0 and plan["season_aligned"]
+    assert plan["settled_months"] == 12
+    # the planned front makes the LARGEST district convert and settle in time
+    assert plan["need_n_months"] <= 50
+    assert plan["convert_months"] >= plan["max_eccentricity"]
+    p = excite.probe_params(world, _probe(horizon="world"), plan, "District_B",
+                            ("low", "residential"), BASE["sensor_placement"][
+                                "probe"]["transitions"],
+                            {"variant": "baseline"}, 42)
+    assert p["time"]["n_months"] == 50 and p["time"]["days_per_month"] == 30
+    assert p["scenario"]["drift"]["warmup_months"] == 12
+    assert p["patterns"]["seasonality_scale"] == 1.0
+    assert p["patterns"]["drift_ramp_days"] == 42
+    # seasonality none: same grid, no season, the probe block's settled rule
+    flat = excite.horizon_plan(wn, part["districts"], meta,
+                               _probe(horizon="world", seasonality="none"),
+                               world)
+    assert flat["seasonality_scale"] == 0.0 and not flat["season_aligned"]
+    assert flat["settled_months"] == BASE["sensor_placement"]["probe"][
+        "settled_months"]
+
+
+def test_world_modes_refuse_what_cannot_settle(wn, manual_part):
+    part, meta = manual_part
+    with pytest.raises(ValueError, match="whole-year"):
+        excite.horizon_plan(wn, part["districts"], meta,
+                            _probe(horizon="world", seasonality="world"),
+                            _world_blocks(warmup=2))
+    with pytest.raises(ValueError, match="needs n_months >="):
+        excite.horizon_plan(wn, part["districts"], meta,
+                            _probe(horizon="world", seasonality="world"),
+                            _world_blocks(n_months=30))
+    # the world's own front (2 nodes/month, growth 0.8) cannot convert the
+    # 316-junction district in 50 months
+    with pytest.raises(ValueError, match="diffusion=world"):
+        excite.horizon_plan(wn, part["districts"], meta,
+                            _probe(horizon="world", seasonality="world",
+                                   diffusion="world"), _world_blocks())
+    with pytest.raises(ValueError, match="horizon"):
+        excite.probe_modes({"horizon": "probe"})
+    with pytest.raises(ValueError, match="world"):
+        excite.horizon_plan(wn, part["districts"], meta,
+                            _probe(horizon="world"), None)
+    # defaults stay on the planned grid
+    assert excite.probe_modes(BASE["sensor_placement"]["probe"]) == {
+        "horizon": "planned", "diffusion": "planned", "seasonality": "none"}
+
+
+def test_stack_identity_follows_the_world_grid_in_world_mode(wn, manual_part):
+    from fedwater.hashing import canonical_hash
+    part, meta = manual_part
+    classes = BASE["sensor_placement"]["classes"]
+
+    def h(world, probe):
+        plan = excite.horizon_plan(wn, part["districts"], meta, probe, world)
+        return canonical_hash(store.stack_spec(
+            network=NETWORK, partition=meta, world=world, probe=probe,
+            classes=classes, plan=plan, coupling={"variant": "baseline"},
+            seed=42))
+
+    wm = _probe(horizon="world", seasonality="world")
+    pl = _probe()
+    base = h(_world_blocks(), wm)
+    assert h(_world_blocks(n_months=60), wm) != base      # world grid is identity
+    assert h(_world_blocks(seasonality=0.5), wm) != base
+    assert h(_world_blocks(n_months=60), pl) == h(_world_blocks(), pl)  # planned
+    assert h(_world_blocks(seasonality=0.5), pl) == h(_world_blocks(), pl)
+    assert h(_world_blocks(), pl) != base
+
+
+def test_season_windows_cover_whole_years():
+    from fedwater.placement import mixture_probe as mp
+    from fedwater.placement import signal_probe as sp
+    sch = pd.DataFrame({"node": ["n1", "n2"], "drift_month": [12, 20],
+                        "district": ["A", "A"]})
+    P = sp.Probe(districts={"A": ["n1", "n2"]}, assets={}, demand=pd.DataFrame(),
+                 pressures=pd.DataFrame(), flows=pd.DataFrame(), schedule=sch,
+                 time={"n_months": 50, "days_per_month": 30, "resolution_h": 1},
+                 params={"patterns": {"drift_ramp_days": 42}})
+    sm = P.steps_month
+    (b0, b1), (s0, s1) = mp.season_windows(P, pad=1)
+    assert (b0 // sm, b1 // sm) == (0, 12)
+    # final starts at 20 + ceil(42/30) = 22, +1 pad -> 23; 27 months left -> 24
+    assert (s0 // sm, s1 // sm) == (26, 50)
+    assert ((b1 - b0) // sm) % 12 == 0 and ((s1 - s0) // sm) % 12 == 0
+    P.time["n_months"] = 34
+    with pytest.raises(ValueError, match="settled months"):
+        mp.season_windows(P, pad=1)
+
+
+def test_study_keys_reach_the_world_and_the_store_stays_shared(built_partitions):
+    from fedwater.experiments import spec as spec_mod
+    b = spec_mod.bundle(ROOT, NETWORK, "manual")
+    w = spec_mod.resolve_world(
+        {"n_months": 50, "days_per_month": 30, "seasonality_scale": 0.0,
+         "drift_ramp_days": 21, "drift": {"warmup_months": 12},
+         "placement": {"probe": {"horizon": "world", "seasonality": "world"},
+                       "slots": {"pressure": {"pure": 1, "mixed": 1}}}},
+        BASE, NETWORK, 4, b["profile"], b["partition"])
+    o = w["override"]
+    assert o["time"]["days_per_month"] == 30
+    assert o["patterns"]["seasonality_scale"] == 0.0
+    assert o["patterns"]["drift_ramp_days"] == 21
+    assert set(o["patterns"]) == set(BASE["patterns"])       # full block
+    assert o["sensor_placement"]["probe"]["horizon"] == "world"
+    assert o["sensor_placement"]["slots"]["flow"] == BASE["sensor_placement"][
+        "slots"]["flow"]                                       # deep merge
+    # written back as the interpolation, so clones share the engine's store
+    assert o["sensor_placement"]["store"] == "${globals:probe_store}"
+    assert "store" not in w["effective"]["sensor_placement"]
+    assert w["flat"]["probe_horizon"] == "world"
+    assert w["flat"]["days_per_month"] == 30
+    same = spec_mod.resolve_world(
+        {"n_months": 50, "days_per_month": 30, "seasonality_scale": 0.0,
+         "drift_ramp_days": 21, "drift": {"warmup_months": 12},
+         "sim_overrides": {"sensor_placement": {
+             "probe": {"horizon": "world", "seasonality": "world"},
+             "slots": {"pressure": {"pure": 1, "mixed": 1}}}}},
+        BASE, NETWORK, 4, b["profile"], b["partition"])
+    assert same["sim_hash"] == w["sim_hash"]                   # one meaning
+    with pytest.raises(ValueError, match="districting"):
+        spec_mod.resolve_world({"sim_overrides": {"districting": {"k": 5}}},
+                               BASE, NETWORK, 4, b["profile"], b["partition"])
+    seasonal = spec_mod.resolve_world(
+        {"drift": {"warmup_months": 2},
+         "placement": {"probe": {"horizon": "world",
+                                 "seasonality": "world"}}},
+        BASE, NETWORK, 4, b["profile"], b["partition"])
+    with pytest.raises(ValueError, match="whole-year"):
+        spec_mod.validate_world(seasonal, b["districts"])
+
+
+def test_engine_preflight_refuses_a_horizon_the_probes_cannot_fill(
+        tmp_path, built_partitions):
+    from fedwater.experiments import spec as spec_mod
+    from fedwater.experiments.engine import ExperimentEngine
+    b = spec_mod.bundle(ROOT, NETWORK, "manual")
+    engine = ExperimentEngine(ROOT, root=tmp_path / "exp")
+
+    def world(n):
+        return spec_mod.resolve_world(
+            {"n_months": n, "days_per_month": 30, "drift_ramp_days": 42,
+             "drift": {"warmup_months": 12},
+             "placement": {"probe": {"horizon": "world",
+                                     "seasonality": "world"}}},
+            BASE, NETWORK, 4, b["profile"], b["partition"])
+
+    with pytest.raises(ValueError, match="does not fit for 1 world"):
+        engine.preflight_placement({"worlds": [world(40)]})
+    engine.preflight_placement({"worlds": [world(50)]})
+    manual = copy.deepcopy(world(40))
+    manual["effective"]["sensor_placement"]["source"] = "manual"
+    engine.preflight_placement({"worlds": [manual]})       # nothing to plan

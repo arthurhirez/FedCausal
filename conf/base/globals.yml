@@ -12,10 +12,10 @@ districting:
   # The partition every world is built on: a directory under
   # data/01_raw/<network>/partitions/.
   #   manual | spectral | girvan_newman | fast_greedy | walktrap
-  active: spectral
+  active: manual
   # What `kedro run --pipeline districting` builds and compares. Include
   # `active`. Hyperparameters live in parameters.yml (`districting`).
-  methods: [spectral, girvan_newman, fast_greedy, walktrap]
+  methods: [manual, spectral, girvan_newman, fast_greedy, walktrap]
 
 # Probe stacks (the sensor-placement excitation worlds) are shared across
 # worlds and content-addressed. The experiments engine replaces this with an

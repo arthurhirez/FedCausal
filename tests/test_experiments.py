@@ -290,7 +290,7 @@ def test_expand_study_resolves_the_declared_studies(built_partitions):
 def test_study_partitions_reads_the_districting_axis():
     pairs = spec_mod.study_partitions("ky7_districting_probe", Path.cwd())
     assert pairs == [("ky7", m) for m in
-                     ("fast_greedy", "girvan_newman", "manual", "spectral")]
+                     ("fast_greedy", "girvan_newman", "spectral")]
 
 
 def test_effective_fl_seed_fallback_and_zero():
