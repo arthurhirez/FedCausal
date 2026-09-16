@@ -30,6 +30,19 @@ NOT a parameter override -- it is written to ``conf/local/globals.yml``, which
 is what the catalog interpolates. Adding it changes every existing world hash;
 ``data/09_experiments/worlds/`` must be re-simulated.
 
+PARTITION AXIS: ``districting`` names the partition method a world is built on
+(``manual`` | ``spectral`` | ``girvan_newman`` | ``fast_greedy`` |
+``walktrap``); omitted, it is ``globals.districting.active``. Like
+``network`` it reaches the catalog through ``conf/local/globals.yml``, and the
+world hash folds in the partition's CONTENT id, so rebuilding a partition that
+changes the cut invalidates every world built on it.
+
+SENSORS are no longer part of the input: ``sensor_placement`` chooses them per
+world, after the probes. Their identity is the ``sensor_placement`` parameter
+block (minus the store path, which is deployment, not physics). A world with
+``sensor_placement.source: manual`` still hashes the profile's hand-placed
+block, since that is what it reads.
+
 The consumption map is POSITIONAL over districts in name order, so a map
 written for one network means something different on another. The district
 count is now read from the selected bundle's ``districts.yml`` and validated
@@ -43,14 +56,15 @@ must be re-simulated in full.
 from __future__ import annotations
 
 import copy
-import hashlib
 import itertools
-import json
 import re
 from pathlib import Path
 
 import yaml
 
+from fedwater.config import active_partition, load_base_params, load_globals
+from fedwater.hashing import _canon, canonical_hash  # noqa: F401  (re-export)
+from fedwater.networks import partitions as pstore
 from fedwater.networks import profile as nprofile
 from fedwater.networks.partition import district_nodes
 
@@ -119,12 +133,7 @@ def default_network(project_root: Path) -> str:
     way. Reading base alone let the engine hash and build a world as one
     network while a plain ``kedro run`` in the same project used another.
     """
-    network = None
-    for env in ("base", "local"):
-        path = Path(project_root) / "conf" / env / "globals.yml"
-        if path.exists():
-            network = (yaml.safe_load(path.read_text()) or {}).get(
-                "network", network)
+    network = load_globals(project_root).get("network")
     if network is None:
         raise FileNotFoundError(
             f"No `network` key found in {project_root}/conf/base/globals.yml "
@@ -133,44 +142,43 @@ def default_network(project_root: Path) -> str:
     return network
 
 
-def bundle(project_root: Path, network: str) -> dict:
-    """Paths and contents of one network bundle under ``data/01_raw/``."""
-    root = Path(project_root) / "data/01_raw" / network
+def default_partition(project_root: Path) -> str:
+    """The active partition method (``globals.districting.active``)."""
+    return active_partition(load_globals(project_root))
+
+
+def bundle(project_root: Path, network: str, method: str | None = None) -> dict:
+    """One network bundle, read through partition ``method``.
+
+    ``districts`` is the PARTITION's document (``partitions/<method>/``), which
+    is what a world is built on; ``manual_districts`` is the hand-authored
+    root file. A partition that has not been built raises -- the engine
+    builds it first (``ExperimentEngine.ensure_partitions``).
+    """
+    root = pstore.bundle_dir(project_root, network)
     inp = root / "network.inp"
-    districts_path = root / "districts.yml"
+    districts_path = root / pstore.DISTRICTS_FILE
     profile_path = root / "profile.yml"
     for path in (inp, districts_path, profile_path):
         if not path.exists():
             raise FileNotFoundError(
                 f"Network bundle '{network}' is incomplete: {path} is missing. "
                 f"A bundle needs network.inp, districts.yml and profile.yml.")
-    return {"network": network, "inp": inp,
-            "districts": yaml.safe_load(districts_path.read_text()),
-            "profile": yaml.safe_load(profile_path.read_text())}
+    method = pstore.check_method(method or default_partition(project_root))
+    part = pstore.read_partition(project_root, network, method)
+    profile = yaml.safe_load(profile_path.read_text())
+    return {"network": network, "inp": inp, "method": method,
+            "districts": part["districts"],
+            "manual_districts": yaml.safe_load(districts_path.read_text()),
+            "partition": pstore.partition_meta(part["manifest"], profile),
+            "profile": profile}
 
 
 # --------------------------------------------------------------------------
 # canonical hashing — identity of effective configuration
 # --------------------------------------------------------------------------
-def _canon(obj):
-    """Normalize to hash-stable primitives: sort-insensitive dicts, lists,
-    ints-for-integral-floats (0.0 == 0), numpy scalars -> python."""
-    if isinstance(obj, dict):
-        return {str(k): _canon(v) for k, v in sorted(obj.items(), key=lambda kv: str(kv[0]))}
-    if isinstance(obj, (list, tuple)):
-        return [_canon(v) for v in obj]
-    if isinstance(obj, bool):
-        return obj
-    if isinstance(obj, float):
-        return int(obj) if obj.is_integer() else obj
-    if hasattr(obj, "item"):  # numpy scalar
-        return _canon(obj.item())
-    return obj
-
-
-def canonical_hash(obj, n: int = 12) -> str:
-    payload = json.dumps(_canon(obj), sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(payload.encode()).hexdigest()[:n]
+# `_canon` / `canonical_hash` now live in fedwater.hashing (same algorithm, so
+# every existing hash is unchanged) and are re-exported above.
 
 
 def _deep_merge(base: dict, patch: dict) -> dict:
@@ -227,7 +235,8 @@ def expand_axes(section) -> list[dict]:
 # resolution — spec + base params -> full-block override + effective config
 # --------------------------------------------------------------------------
 def resolve_world(world: dict, base_params: dict, network: str,
-                  n_districts: int, profile: dict | None = None) -> dict:
+                  n_districts: int, profile: dict | None = None,
+                  partition: dict | None = None) -> dict:
     """Build the FULL top-level parameter blocks a world writes to
     ``conf/local`` (Kedro merges destructively at the top level — partial
     blocks silently erase sibling keys, the documented gotcha), plus the
@@ -249,8 +258,14 @@ def resolve_world(world: dict, base_params: dict, network: str,
     ``buildings`` and ``patterns``. They still reach the hash through
     ``effective``, so editing them invalidates caches correctly; a study that
     wants to sweep them goes through ``sim_overrides``.
+
+    ``partition`` is ``networks.partitions.partition_meta`` for the partition
+    the world is built on (``bundle()["partition"]``). Omitted, the world is
+    described as the manual partition with no content id -- enough for
+    hashing tests, never for a real build.
     """
     base, _ = nprofile.resolve_params(base_params, profile or {})
+    partition = partition or {"method": pstore.MANUAL, "partition_id": None}
     scenario = copy.deepcopy(base["scenario"])
     n_months = int(world.get("n_months", base["time"]["n_months"]))
     scenario["n_months"] = n_months
@@ -295,18 +310,32 @@ def resolve_world(world: dict, base_params: dict, network: str,
     # it in `effective` is what stops a Graeme world being reused under a
     # D-Town label.
     effective["network"] = network
-    # SENSOR PLACEMENT, the same gap network_params closed for anchor_scale
-    # et al. `extract_sensor_series` reads `network_profile["sensors"]`
-    # straight from the bundle at kedro-run time, which is correct for the
-    # simulation itself -- but resolve_world never touched it, so it was
-    # invisible to BOTH consequences of not being in `effective`: the world's
-    # content hash did not change if `profile.yml`'s sensors changed (a world
-    # simulated under an old placement would be served from cache under a
-    # NEW one, silently), and the manifest -- which dumps `effective`
-    # verbatim -- had nothing to show. Folding it in here fixes both with the
-    # one change; see PROVENANCE below for why the study index still won't
-    # show it.
-    effective["sensors"] = copy.deepcopy((profile or {}).get("sensors") or {})
+    # THE PARTITION. Its method reaches the catalog through globals; its
+    # CONTENT id is what makes the hash honest: a rebuilt partition with a
+    # different cut is a different world, one that reproduces the cut is not.
+    # The districting dials themselves are not identity -- only their result
+    # is -- so the block is dropped.
+    effective.pop("districting", None)
+    effective["partition"] = {"method": partition["method"],
+                              "partition_id": partition.get("partition_id")}
+    # SENSOR PLACEMENT. Sensors are an OUTPUT of the world now (chosen by
+    # `sensor_placement` from the probe stacks), so the world's identity is
+    # the rule that chooses them, i.e. the `sensor_placement` block -- minus
+    # `store`, which is where the stacks live, not what they are. A manual
+    # placement reads the profile's block, so for `source: manual` that block
+    # IS identity, exactly as before the refactor: a world simulated under an
+    # old hand placement must not be served under a new one.
+    placement = copy.deepcopy(effective.get("sensor_placement") or {})
+    placement.pop("store", None)
+    effective["sensor_placement"] = placement
+    source = placement.get("source", "dynamic")
+    manual_sensors = (copy.deepcopy((profile or {}).get("sensors") or {})
+                      if source == "manual" else {})
+    if source == "manual":
+        effective["manual_sensors"] = manual_sensors
+    slots = placement.get("slots") or {}
+    per_district = {k: int(v.get("pure", 0)) + int(v.get("mixed", 0))
+                    for k, v in slots.items()}
     flat = {
         "network": network,
         "sim_seed": override["seed"],
@@ -323,19 +352,27 @@ def resolve_world(world: dict, base_params: dict, network: str,
         # PROVENANCE, not identity: `flat` becomes a column of runs.parquet
         # (engine.collect flattens `manifest["world"]`, which IS `flat`), and
         # that table is one row per run, so every entry here must be a
-        # scalar. The full per-district sensor lists live in `effective`
-        # (and therefore in each world's manifest.json in full) because a
-        # nested dict cannot be a column; this is the count, to make a
-        # placement change at least VISIBLE in the flat index without
-        # breaking it.
-        "n_pressure_sensors": sum(len(c.get("pressure", []))
-                                  for c in effective["sensors"].values()),
-        "n_flow_sensors": sum(len(c.get("flow", []))
-                              for c in effective["sensors"].values()),
+        # scalar. The chosen sensors themselves are a world ARTIFACT
+        # (data/03_primary/sensor_placement.csv); these are the counts.
+        "districting": partition["method"],
+        "partition_id": partition.get("partition_id"),
+        "placement_source": source,
+        "slots_pressure": per_district.get("pressure", 0),
+        "slots_flow": per_district.get("flow", 0),
+        "n_pressure_sensors": (
+            sum(len(c.get("pressure", [])) for c in manual_sensors.values())
+            if source == "manual"
+            else per_district.get("pressure", 0) * n_districts),
+        "n_flow_sensors": (
+            sum(len(c.get("flow", [])) for c in manual_sensors.values())
+            if source == "manual"
+            else per_district.get("flow", 0) * n_districts),
     }
     return {"sim_hash": canonical_hash(effective), "override": override,
             "effective": effective, "flat": flat, "network": network,
-            "globals": {"network": network}}
+            "globals": {"network": network,
+                        "districting": {"active": partition["method"],
+                                        "methods": [partition["method"]]}}}
 
 
 def resolve_run(run: dict, base_params: dict,
@@ -417,6 +454,8 @@ def validate_world(resolved: dict, districts: dict) -> None:
             f"the initial map state ({init_income}, {init_land_use}). At least "
             f"one of income or land use must change.")
 
+    validate_placement(eff)
+
     warmup = int(eff["scenario"]["drift"].get("warmup_months", 0))
     if warmup < 1:
         # apply_drift_ramp blends the new regime against the month BEFORE the
@@ -426,6 +465,36 @@ def validate_world(resolved: dict, districts: dict) -> None:
         raise ValueError(
             f"n_months={flat['n_months']} leaves no room for drift "
             f"(warmup_months={warmup}); need at least warmup + 2.")
+
+
+def validate_placement(eff: dict) -> None:
+    """The ``sensor_placement`` block, checked before any probe is solved."""
+    from fedwater.placement.excite import validate_transitions
+
+    sp = eff.get("sensor_placement") or {}
+    source = sp.get("source", "dynamic")
+    if source not in ("dynamic", "manual"):
+        raise ValueError(f"sensor_placement.source {source!r} is not "
+                         "'dynamic' or 'manual'.")
+    if source == "manual":
+        if not eff.get("manual_sensors"):
+            raise ValueError("sensor_placement.source is 'manual' but the "
+                             "bundle profile has no `sensors:` block.")
+        return
+    slots = sp.get("slots") or {}
+    if not slots or set(slots) - {"flow", "pressure"}:
+        raise ValueError(f"sensor_placement.slots must be keyed by flow / "
+                         f"pressure, got {sorted(slots)}.")
+    for kind, v in slots.items():
+        if min(int(v.get("pure", 0)), int(v.get("mixed", 0))) < 0 \
+                or int(v.get("pure", 0)) + int(v.get("mixed", 0)) == 0:
+            raise ValueError(f"sensor_placement.slots.{kind} needs a "
+                             f"non-negative, non-zero pure + mixed, got {v}.")
+    ref = (sp.get("selection_coupling") or {}).get("variant")
+    if ref not in ("baseline", "isolated"):
+        raise ValueError("sensor_placement.selection_coupling.variant must be "
+                         f"baseline or isolated, got {ref!r}.")
+    validate_transitions(sp["probe"]["transitions"], eff["land_use"])
 
 
 def with_anchor(resolved: dict, anchor_scale: float) -> dict:
@@ -511,6 +580,21 @@ def load_studies(project_root: Path) -> dict:
     return cfg
 
 
+def study_partitions(name: str, project_root: Path) -> list[tuple[str, str]]:
+    """``(network, method)`` pairs a study's worlds are built on.
+
+    Read from the axes alone, so the engine can build missing partitions
+    BEFORE ``expand_study`` needs to read them.
+    """
+    cfg = load_studies(project_root)
+    study = cfg["studies"][name]
+    fallback = default_network(project_root)
+    fallback_method = default_partition(project_root)
+    return sorted({(w.get("network", fallback),
+                    pstore.check_method(w.get("districting", fallback_method)))
+                   for w in expand_axes(study.get("worlds"))})
+
+
 def expand_study(name: str, project_root: Path) -> dict:
     """Resolve one named study into validated world specs x run specs.
 
@@ -526,34 +610,41 @@ def expand_study(name: str, project_root: Path) -> dict:
         raise KeyError(f"Study '{name}' not found; available: "
                        f"{sorted(cfg.get('studies', {}))}.")
     study = cfg["studies"][name]
-    base = yaml.safe_load((project_root / "conf/base/parameters.yml").read_text())
+    base = load_base_params(project_root)
     fallback = default_network(project_root)
+    fallback_method = default_partition(project_root)
 
     pipelines = tuple(study.get("pipelines", DEFAULT_PIPELINES))
     worlds, bundles = [], {}
     for w in expand_axes(study.get("worlds")):
         w = copy.deepcopy(w)
         network = w.pop("network", fallback)
-        if network not in bundles:
-            bundles[network] = bundle(project_root, network)
-        b = bundles[network]
+        method = w.pop("districting", fallback_method)
+        key = (network, method)
+        if key not in bundles:
+            bundles[key] = bundle(project_root, network, method)
+        b = bundles[key]
         districts, inp = b["districts"], b["inp"]
         n_districts = len(district_nodes(districts))
 
-        resolved = resolve_world(w, base, network, n_districts, b["profile"])
+        resolved = resolve_world(w, base, network, n_districts, b["profile"],
+                                 b["partition"])
         if resolved["flat"]["drift_seed_node"] is None:
-            # Precedence (explicit > profile > auto) lives in ONE function,
-            # shared with build_drift_schedule, so the engine and a plain
-            # `kedro run` cannot pick different origins. The auto-picker
+            # Precedence (explicit > partition seed source > auto) lives in
+            # ONE function, shared with build_drift_schedule, so the engine
+            # and a plain `kedro run` cannot pick different origins. The seed
+            # source is `partition_meta` -- the profile's drift_seed_nodes for
+            # the manual partition, none for a generated one. The auto-picker
             # passed here is the .inp-TEXT one, which keeps spec expansion
             # free of a wntr load; it agrees with the model-based picker in
             # networks.partition on every district of every bundle.
             tgt = resolved["flat"]["drift_district"]
             node = nprofile.resolve_seed_node(
-                None, b["profile"], tgt,
+                None, b["partition"], tgt,
                 lambda: auto_seed_node(tgt, districts, inp))
             w = _deep_merge(w, {"drift": {"seed_node": node}})
-            resolved = resolve_world(w, base, network, n_districts, b["profile"])
+            resolved = resolve_world(w, base, network, n_districts,
+                                     b["profile"], b["partition"])
         validate_world(resolved, districts)
         worlds.append(resolved)
     runs = [resolve_run(r, base, pipelines) for r in expand_axes(study.get("runs"))]
@@ -564,7 +655,8 @@ def expand_study(name: str, project_root: Path) -> dict:
         raise ValueError(f"Study '{name}' contains duplicate run specs.")
     return {"name": name, "worlds": worlds, "runs": runs,
             "pipelines": pipelines,
-            "networks": sorted(bundles),
+            "networks": sorted({n for n, _ in bundles}),
+            "partitions": sorted(bundles),
             "harvest": tuple(study.get("harvest",
                              ("validation", "drift", "ladder", "c4",
                               "dependence"))),

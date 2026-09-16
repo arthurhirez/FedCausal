@@ -14,6 +14,7 @@ import pandas as pd
 import wntr
 
 from fedwater.networks import options as opt
+from fedwater.networks import partitions as pstore
 from fedwater.networks import profile as nprofile
 from fedwater.networks.partition import (
     district_nodes,
@@ -44,6 +45,36 @@ def resolve_network_parameters(network_profile: dict, hydraulics: dict,
     resolved, report = nprofile.resolve_params(params, network_profile)
     return (resolved["hydraulics"], resolved["scenario"],
             resolved["validation"], report)
+
+
+def resolve_partition(partition_manifest: dict, network_profile: dict,
+                      districts: dict) -> dict:
+    """The active partition's identity, and the drift-seed source valid for it.
+
+    ``districts`` comes from ``partitions/${globals:districting.active}/``; its
+    manifest sits beside it. Checking that the two agree catches the one way
+    they can drift apart -- a hand edit to a generated ``districts.yml`` --
+    before a world is built on a partition whose recorded id is not its
+    content.
+
+    The returned dict stands in for ``network_profile`` in
+    ``build_drift_schedule``: it carries ``name`` and ``drift_seed_nodes``, and
+    the latter is the profile's only for the ``manual`` partition (see
+    ``networks.partitions.seed_source``).
+    """
+    meta = pstore.partition_meta(partition_manifest, network_profile)
+    actual = pstore.partition_id(districts)
+    if meta["partition_id"] != actual:
+        raise ValueError(
+            f"partition '{meta['method']}' of '{meta['name']}': districts.yml "
+            f"has content id {actual} but partition.yml records "
+            f"{meta['partition_id']}. The file was edited after it was built; "
+            "rebuild it with `kedro run --pipeline districting`.")
+    if meta["network"] not in (None, network_profile.get("name")):
+        raise ValueError(
+            f"partition.yml was built for network {meta['network']!r} but the "
+            f"selected bundle is {network_profile.get('name')!r}.")
+    return meta
 
 
 def configure_network(wn, network_profile: dict, hydraulics: dict, time: dict):
@@ -150,6 +181,9 @@ def apply_coupling(wn, districts: dict, coupling: dict, seed: int):
     partial  : close a fraction ``close_fraction`` of inter-district pipes.
     isolated : close *all* inter-district pipes and give each district its own
                reservoir (same head as the original source) — min coupling.
+    explicit : close exactly ``coupling["closed"]`` (boundary pipe names), no
+               draw. Used by sensor placement to rebuild a world's REALISED
+               closure set in its label probes; not a study axis.
 
     The returned boundary table records which pipes exist between districts and
     which were closed: this is dependence ground truth, not a side effect.
@@ -202,6 +236,12 @@ def apply_coupling(wn, districts: dict, coupling: dict, seed: int):
                 G.add_edge(u, v, key=row["pipe"])
     elif variant == "isolated":
         to_close = set(boundaries["pipe"])
+    elif variant == "explicit":
+        to_close = {str(p) for p in (coupling.get("closed") or [])}
+        unknown = sorted(to_close - set(boundaries["pipe"]))
+        if unknown:
+            raise ValueError(f"coupling 'explicit': {unknown} are not "
+                             "inter-district pipes of this partition")
     else:
         raise ValueError(f"Unknown coupling variant: {variant!r}")
 

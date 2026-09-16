@@ -37,7 +37,7 @@ districts, so the import arrow points that way and not back.
 """
 from __future__ import annotations
 
-from . import coupling, graph, hydraulics, metrics, partition, plots, runner, weights, yaml_io
+from . import coupling, graph, hydraulics, metrics, partition, runner, weights, yaml_io
 from .graph import (
     VALVE_TYPES_REGULATING,
     build_graph,
@@ -71,3 +71,16 @@ __all__ = [
     "coupling", "graph", "hydraulics", "metrics", "partition", "plots", "runner",
     "weights", "yaml_io",
 ]
+
+
+def __getattr__(name):
+    # `plots` pulls in matplotlib (and ipywidgets on use). The Kedro nodes never
+    # draw, so it is imported on first access -- `dst.plots.plot_districts`
+    # keeps working in a notebook exactly as before.
+    if name == "plots":
+        import importlib
+
+        mod = importlib.import_module(".plots", __name__)
+        globals()["plots"] = mod
+        return mod
+    raise AttributeError(name)

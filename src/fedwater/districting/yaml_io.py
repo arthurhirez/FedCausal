@@ -106,19 +106,27 @@ def write_districts_yml(path, wn, labels: pd.Series, header: str = "") -> Path:
     against a hand-maintained one rather than a wholesale reformat.
     """
     path = Path(path)
-    mapping = districts_mapping(wn, labels)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(render_districts_yml(districts_mapping(wn, labels), header))
+    return path
 
+
+def render_districts_yml(mapping: dict, header: str = "") -> str:
+    """The ``districts.yml`` TEXT for an already-split mapping.
+
+    Separated from :func:`write_districts_yml` so a Kedro node can hand the
+    text to the catalog instead of writing a path itself; the formatting is the
+    one the writer always used.
+    """
     lines = [l if l.startswith("#") else "# " + l for l in header.splitlines()]
     if lines:
         lines.append("")
     for section in ("districts", "assets"):
         lines.append("%s:" % section)
-        for d, members in mapping[section].items():
+        for d, members in (mapping.get(section) or {}).items():
             lines.append("  %s: [%s]" % (d, ", ".join("'%s'" % n for n in members)))
         lines.append("")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines).rstrip() + "\n")
-    return path
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def read_districts_yml(path) -> dict:

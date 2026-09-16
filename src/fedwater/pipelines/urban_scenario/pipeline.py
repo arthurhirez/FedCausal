@@ -34,7 +34,9 @@ def create_pipeline(**kwargs) -> Pipeline:
             ),
             node(
                 build_drift_schedule,
-                inputs=["wn_variant", "districts", "network_profile",
+                # `partition_meta` stands in for the profile here: same `name`,
+                # and `drift_seed_nodes` only when the partition is `manual`.
+                inputs=["wn_variant", "districts", "partition_meta",
                         "scenario_cfg", "params:seed"],
                 outputs="gt_drift_schedule",
                 name="build_drift_schedule",

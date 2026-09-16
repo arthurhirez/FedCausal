@@ -18,7 +18,8 @@ with three spellings is a rule that drifts back apart.
 
 Not to be confused with
 -----------------------
-``experiments.spec.canonical_hash``, which answers a different question:
+:func:`canonical_hash` (below, re-exported by ``experiments.spec``), which
+answers a different question:
 IDENTITY of a configuration, over arbitrarily nested dicts, normalised so that
 ``0`` and ``0.0`` agree, and truncated to a short hex string for use as a cache
 key. This module answers "give me a stable integer to seed a generator with".
@@ -27,6 +28,8 @@ changing cache keys to fix an RNG, or vice versa.
 """
 from __future__ import annotations
 
+import hashlib
+import json
 import zlib
 
 
@@ -51,3 +54,43 @@ def stable_hash(obj) -> int:
       identity; use ``canonical_hash`` when the answer must identify a thing.
     """
     return zlib.crc32(repr(obj).encode()) % 2**31
+
+
+# --------------------------------------------------------------------------
+# identity hashing -- the OTHER job, kept as a separate function on purpose
+# --------------------------------------------------------------------------
+# Moved here verbatim from ``experiments.spec`` so that ``networks.partitions``
+# and ``placement.store`` can content-address their caches without importing
+# the experiments layer (which itself imports ``networks``). Same algorithm,
+# same output: every existing ``sim_hash`` / ``run_hash`` is unchanged.
+def _canon(obj):
+    """Normalize to hash-stable primitives: sort-insensitive dicts, lists,
+    ints-for-integral-floats (0.0 == 0), numpy scalars -> python."""
+    if isinstance(obj, dict):
+        return {str(k): _canon(v) for k, v in sorted(obj.items(), key=lambda kv: str(kv[0]))}
+    if isinstance(obj, (list, tuple)):
+        return [_canon(v) for v in obj]
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, float):
+        return int(obj) if obj.is_integer() else obj
+    if hasattr(obj, "item"):  # numpy scalar
+        return _canon(obj.item())
+    return obj
+
+
+def canonical_hash(obj, n: int = 12) -> str:
+    """Short hex identity of an arbitrarily nested configuration."""
+    payload = json.dumps(_canon(obj), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode()).hexdigest()[:n]
+
+
+def text_sha(text: str, n: int = 16) -> str:
+    """Identity of a text file's CONTENT, newline-normalised.
+
+    Callers read with universal newlines (``Path.read_text`` / a Kedro
+    ``TextDataset``), so a CRLF ``.inp`` and its LF copy hash the same, and
+    the engine (which reads the file) and a node (which gets it from the
+    catalog) always agree.
+    """
+    return hashlib.sha256(text.replace("\r\n", "\n").encode()).hexdigest()[:n]

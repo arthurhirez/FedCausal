@@ -45,6 +45,11 @@ root: data/09_experiments
 # in name order, so the same string means different things on two networks; and
 # `drift.seed_node` is a network-specific id -- leave it unset and let the
 # auto-picker (largest-base-demand junction) choose per network.
+#
+# `districting` is a world axis too (partition method; default
+# globals.districting.active) and is also part of the world hash, through the
+# partition's content id. A profile's `drift_seed_nodes` apply to the MANUAL
+# partition only.
 
 studies:
 
@@ -125,6 +130,47 @@ studies:
           n_surrogates: 20
           n_surrogates_expensive: 8
           minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+    runs:
+      fixed: {rounds: 8}
+    pipelines: []
+    harvest: [validation]
+
+  # ---------------------------------------- KY7 districting x placement --
+  # TEMPLATE for the dynamic-input pipeline. `districting` is a world axis
+  # like `network` (default: globals.districting.active); the engine builds
+  # any partition a study names that is missing or stale BEFORE expanding it.
+  # Sensors are chosen per world by the `sensor_placement` pipeline; worlds
+  # that share an initial map and operating point share one probe stack.
+  #
+  # `seed_node` is omitted on purpose: the profile's J-507 is honoured for
+  # the manual partition only; a generated partition uses the auto-picker
+  # (largest-base-demand junction). Generated districts are named by SIZE,
+  # so `District_A` is the largest district there -- the same token asks a
+  # different, larger conversion of the network than it does on `manual`.
+  #
+  # walktrap is left out: on KY7 it cuts an 8-junction district, which may
+  # not hold the 10 slots per district sensor_placement asks for.
+  ky72_districting_probe:
+    description: >
+      KY7 baseline world on manual + three generated partitions, dynamic
+      sensors, 24 months. Worlds only; FL not run.
+    worlds:
+      fixed:
+        network: ky72
+        sim_seed: 42
+        n_months: 50
+        beta: 0.50
+        coupling: {variant: baseline, close_fraction: 0.0}
+        drift: {tgt_district: District_A, warmup_months: 12,
+                to_income: low, to_land_use: industrial,
+                consumption_map: [LR_LR_LR_LR]}
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+      grid:
+        districting: [spectral, girvan_newman, fast_greedy]
     runs:
       fixed: {rounds: 8}
     pipelines: []

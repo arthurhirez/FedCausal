@@ -2,7 +2,12 @@ from kedro.pipeline import Pipeline, node
 
 from fedwater.networks.partition import validate_partition
 
-from .nodes import apply_coupling, configure_network, resolve_network_parameters
+from .nodes import (
+    apply_coupling,
+    configure_network,
+    resolve_network_parameters,
+    resolve_partition,
+)
 
 
 def create_pipeline(**kwargs) -> Pipeline:
@@ -19,6 +24,14 @@ def create_pipeline(**kwargs) -> Pipeline:
                 outputs=["hydraulics_cfg", "scenario_cfg", "validation_cfg",
                          "network_params_report"],
                 name="resolve_network_parameters",
+            ),
+            # The active partition (globals.districting.active) and the seed
+            # source valid for it. Built by `--pipeline districting`.
+            node(
+                resolve_partition,
+                inputs=["partition_manifest", "network_profile", "districts"],
+                outputs="partition_meta",
+                name="resolve_partition",
             ),
             node(
                 configure_network,

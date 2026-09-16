@@ -316,10 +316,114 @@ patterns:
   #   medium: {morning: [7.0, 2.6], afternoon: [14.0, 1.6], evening: [19.0, 2.0]}
   #   high:   {morning: [7.5, 1.4], afternoon: [14.0, 1.2], evening: [19.5, 1.8]}
 
-# NOTE: `sensors` moved to data/01_raw/<network>/profile.yml. Sensor placement
-# is a property of the NETWORK, not of the scenario, and keeping it here meant
-# switching networks by commenting blocks in and out -- which is exactly the
-# kind of change that fails silently.
+# =========================================================================
+# DISTRICTING -- `kedro run --pipeline districting`, once per network.
+# =========================================================================
+# Which methods are built, and which one worlds use, are GLOBALS
+# (conf/base/globals.yml: districting.methods / districting.active) because
+# the active method is part of the catalog path. The dials below identify a
+# build: changing one marks that method's partition stale
+# (partitions/<method>/partition.yml: config_hash), and a rebuild that changes
+# the cut changes `partition_id` and with it every world hash built on it.
+#
+# `auto` is this file's spelling of "per-method default". `null` is reserved
+# above for network-scoped keys filled from the bundle profile.
+districting:
+  methods: ${globals:districting.methods}
+  k: auto                  # number of districts, FIXED (never optimised).
+                           # auto = the manual partition's count (KY7 4,
+                           # D-Town 5, Graeme 5), which keeps every positional
+                           # consumption map valid under every method.
+  seed: 3                  # spectral k-means and the Phase-3 search
+  on_disconnected: raise   # raise | largest
+  spectral:
+    weights:               # composite edge weight (POC Phase 1b)
+      w_resistance: 1.0
+      w_elevation: 1.0
+      w_valve_cut: 1.0
+      w_coupling: 0.0      # > 0 needs a measured coupling matrix under
+                           # data/08_reporting/dependency/ground_truth/
+      elevation_bandwidth_m: auto
+      valve_cut_discount: 0.05
+      closed_link_discount: 0.01
+  postprocess:             # never applied to `manual` (adopted as written)
+    repair: auto           # auto: spectral repairs fragments, community
+                           # methods do not
+    balance_target: auto   # auto: spectral -> demand; community -> none
+    balance_tol: 0.15
+  phase3:                  # boundary open/close optimisation. REPORT ONLY:
+                           # it fills boundary.csv, it never alters the cut.
+    optimizer: none        # none | exhaustive | nsga2 | auto
+    criteria: {min_pressure_m: 14.0, max_velocity_ms: 3.0, mode: paper}
+    budget: 20000          # max evaluations for exhaustive / auto
+    nsga2: {pop_size: 60, generations: 25, seed: 0}
+    force_optimize: false
+
+# =========================================================================
+# SENSOR PLACEMENT -- per world, part of __default__.
+# =========================================================================
+# Sensors are chosen per world from PROBE STACKS: K excitation worlds at the
+# world's operating point (network, partition, initial consumption map, beta,
+# anchor, coupling), each converting one district's land use. The stack gives
+# every candidate gauge its district mixture; that mixture is the label, and
+# the placement is chosen from it -- never from the world's own drift.
+# Stacks are cached by content hash under globals.probe_store and reused by
+# every world that shares their operating point.
+#
+# `manual` reads the bundle profile's hand-placed `sensors:` block instead
+# (no probes; client CSVs keep element-named columns).
+sensor_placement:
+  source: dynamic          # dynamic | manual
+  store: ${globals:probe_store}
+
+  # Identical for every district -> identical client feature geometry.
+  # Columns are named by slot: q_pure_0..2, q_mixed_0..1, p_pure_0..2, ...
+  slots:
+    flow:     {pure: 3, mixed: 2}
+    pressure: {pure: 3, mixed: 2}
+
+  classes:
+    core_purity: 0.85        # pure: home share >= this
+    foreign_max: 0.15        # tier `foreign` below this home share
+    mixed_min_foreign: 0.25  # mixed: largest single foreign share >= this
+    min_n_mass: 2            # mixed: at least this many districts carry mass
+    max_purity_swing: 0.20   # mixed: purity may move at most this much across
+                             # `null_factors` (1.0 disables the gate)
+    null_factor: 1.5         # a response counts when |proj| > factor x noise
+    null_factors: [1.0, 1.5, 3.0]
+  dedupe_min_distance: 0.10  # two gauges closer than this read the same thing
+
+  # Sensors are SELECTED on a stack at this coupling (baseline | isolated), so
+  # every coupling arm of a study gets the same sensors. Their LABELS
+  # (w_<District> in sensor_placement.csv) come from a stack at the world's
+  # REALISED coupling -- its actual closed pipes -- so a `partial` draw that
+  # closed nothing shares the baseline stack.
+  selection_coupling: {variant: baseline}
+
+  probe:
+    # initial land use -> the land use a district's probe converts it to.
+    # Every class in land_use.mix must appear; none may map to itself.
+    transitions:
+      residential: industrial
+      mixed: industrial
+      commercial: industrial
+      industrial: residential
+    seed: 42                 # probe demand draws (closures never depend on
+                             # it: label stacks close an explicit pipe set)
+    days_per_month: 14       # probe horizon -- NOT the world's
+    warmup_months: 8
+    convert_months: 12       # target conversion time for the largest district
+    settled_months: 8        # post-ramp months the settled window needs
+    n_months: auto           # auto = what horizon_plan says the partition needs
+    max_neighbors_per_month: auto
+    drift_ramp_days: 7
+    growth_chance: 1.0
+    seasonality_scale: 0.0   # probes isolate the land-use signature
+    settle: {ref_months: 3, slack: 0.01, pad: 1, min_months: 3}
+    battery_max_lag_h: 6.0
+    top_carriers: 5
+    retain_series: true      # keep the K worlds' series (browsers, settle
+                             # panel, selection-vs-demand need them)
 
 noise:                  # instrumentation layer (separate from behaviour)
   pressure_sigma: 0.10          # mca
@@ -420,6 +524,11 @@ fl:                         # ---- federated learning over the client CSVs ----
                             # future and compresses the drift signal.
     label_threshold: 0.75   # majority share required to label a window
     feature_range: [-1.0, 1.0]
+    # Which packaged sensor columns become features. RUN identity: a world
+    # always packages every slot, so changing these never re-simulates.
+    channels: [flow, pressure]   # subset of {flow, pressure}
+    classes: all                 # all | [pure] | [mixed] | [pure, mixed]
+                                 # (slot-named columns only)
   model:
     lstm_units: 30          # latent dim = 2 x units (bi-LSTM bottleneck)
     reg_ratio: 0.5          # AER loss weighting (Wong et al. 2022)

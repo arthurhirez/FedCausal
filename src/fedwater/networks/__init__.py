@@ -6,9 +6,12 @@
                  ownership, and the drift seed-node picker.
 ``profile``      network-scoped parameters: the keys parameters.yml leaves
                  null because their value is a fact about the network.
+``partitions``   the partition store: one districts.yml per (network,
+                 method), its identity, freshness, and drift-seed source.
 ``conditioning`` arbitrary ``.inp`` -> simulation-ready model + a recipe.
 ``capacity``     how much demand a network can carry (lambda*, max_demand_lps).
 """
-from . import capacity, conditioning, options, partition, profile
+from . import capacity, conditioning, options, partition, partitions, profile
 
-__all__ = ["capacity", "conditioning", "options", "partition", "profile"]
+__all__ = ["capacity", "conditioning", "options", "partition", "partitions",
+           "profile"]

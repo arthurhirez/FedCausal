@@ -8,7 +8,7 @@ def create_pipeline(**kwargs) -> Pipeline:
         [
             node(
                 extract_sensor_series,
-                inputs=["pressures", "flows", "network_profile"],
+                inputs=["pressures", "flows", "sensor_placement"],
                 outputs="sensor_series_true",
                 name="extract_sensor_series",
             ),

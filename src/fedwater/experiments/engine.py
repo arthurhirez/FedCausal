@@ -21,10 +21,25 @@ bootstrap gotcha), and cache-or-run — now keyed by **content hash** of the
 effective configuration instead of an ordinal, so editing a spec can never
 silently reuse a stale world.
 
-The selected network travels separately from the parameter override: it is
-written to ``conf/local/globals.yml``, which is what the catalog interpolates
-into the ``.inp`` / districts / profile filepaths. It is still part of the
-world hash, so a world can never be reused across networks.
+The selected network and partition travel separately from the parameter
+override: they are written to ``conf/local/globals.yml``, which is what the
+catalog interpolates into the bundle and partition filepaths. Both are part of
+the world hash (the partition through its content id), so a world is never
+reused across networks or cuts.
+
+Two shared stores sit beside the worlds::
+
+    partitions/<network>__<method>/    scratch clone + manifest of the last
+                                       `--pipeline districting` build; the
+                                       partition itself is copied into the
+                                       PROJECT's data/01_raw/<network>/
+                                       partitions/<method>/
+    probes/<network>/<method>/<hash>/  sensor-placement probe stacks, shared by
+                                       every world clone (globals.probe_store
+                                       is written as this absolute path)
+
+Partitions are built before a study is expanded (:meth:`prepare_study`),
+because expanding reads them.
 
 Failure policy (a): a run/world that fails is *recorded* (status + stdout
 tail in its manifest) and the sweep continues — infeasibility is data.
@@ -48,8 +63,11 @@ from pathlib import Path
 import pandas as pd
 import yaml
 
+from fedwater.config import load_base_params
+from fedwater.networks import partitions as pstore
+
 from . import harvest as harvest_mod
-from .spec import expand_study, with_anchor
+from .spec import expand_study, load_studies, study_partitions, with_anchor
 
 _VALIDATION_MARKERS = ("sim_validation", "V1_", "V2_", "V3_", "V4_", "V5_",
                        "V6_", "pressure floor", "mass balance")
@@ -73,6 +91,7 @@ RETAINABLE = {
 # not evidence (learned from D0: a world clone missing its dependence
 # battery cost 40 downstream runs before anything complained).
 WORLD_REQUIRED = (
+    "data/03_primary/sensor_placement.csv",
     "data/03_primary/gt_topology.csv",
     "data/03_primary/gt_drift_schedule.csv",
     "data/03_primary/gt_dependence_battery.csv",
@@ -159,10 +178,18 @@ class ExperimentEngine:
         shutil.copytree(self.project / "data" / "01_raw",
                         dest / "data" / "01_raw")
 
+    def _globals(self, world: dict) -> dict:
+        """The world's globals plus the ABSOLUTE probe store, so every clone
+        reads and writes one set of probe stacks."""
+        return {**(world.get("globals") or {}),
+                "probe_store": str(self.root / "probes")}
+
     @staticmethod
     def _write_local(clone: Path, params: dict, globals_: dict | None) -> None:
         """Full-block conf/local overrides. `globals` selects the network
-        bundle the catalog interpolates; `parameters` is everything else."""
+        bundle and partition the catalog interpolates (each top-level key is
+        written whole: Kedro replaces them destructively); `parameters` is
+        everything else."""
         local = clone / "conf" / "local"
         local.mkdir(parents=True, exist_ok=True)
         (local / "parameters.yml").write_text(
@@ -193,6 +220,61 @@ class ExperimentEngine:
                           result.stdout + result.stderr)
         return f"{hits[-1][0]}/{hits[-1][1]}" if hits else None
 
+    # -- partitions -----------------------------------------------------------
+    def ensure_partitions(self, pairs) -> dict:
+        """Build every ``(network, method)`` partition that is missing or stale.
+
+        Freshness is ``networks.partitions.status`` against the CURRENT base
+        parameters and ``.inp``. A build runs ``--pipeline districting`` in a
+        scratch clone that selects exactly that network and method, then
+        copies ``partitions/<method>/`` into the project -- the project's own
+        ``conf/local`` is never touched. A failed build raises: nothing can be
+        expanded, let alone simulated, on a partition that does not exist.
+        """
+        districting = load_base_params(self.project)["districting"]
+        out = {}
+        for network, method in sorted(set(pairs)):
+            state = pstore.status(self.project, network, method, districting)
+            if state == "current":
+                out[(network, method)] = "current"
+                continue
+            pdir = self.root / "partitions" / f"{network}__{method}"
+            clone = pdir / "clone"
+            print(f"[partitions] {network}/{method}: {state} -> building ...",
+                  end="", flush=True)
+            self._materialize_clone(clone)
+            self._write_local(clone, {}, {
+                "network": network,
+                "districting": {"active": method, "methods": [method]}})
+            result, seconds = self._kedro(clone, pipeline="districting")
+            built = pstore.partition_dir(clone, network, method)
+            ok = (result.returncode == 0
+                  and pstore.status(clone, network, method, districting)
+                  == "current")
+            _write_json(pdir / "manifest.json", {
+                "network": network, "method": method, "previous": state,
+                "status": "ok" if ok else "failed", "seconds": seconds,
+                "created_utc": _utcnow(), "src_hash": self._src_hash,
+                "tasks_completed": self._tasks_completed(result),
+                "stdout_tail": self._tail(result, 1500 if ok else 4000)})
+            print(" ok" if ok else " FAILED", flush=True)
+            if not ok:
+                raise RuntimeError(
+                    f"districting failed for {network}/{method}; see "
+                    f"{pdir / 'manifest.json'}")
+            target = pstore.partition_dir(self.project, network, method)
+            if target.exists():
+                shutil.rmtree(target)
+            shutil.copytree(built, target)
+            shutil.rmtree(clone)
+            out[(network, method)] = "built"
+        return out
+
+    def prepare_study(self, name: str) -> dict:
+        """Build the partitions a study needs, then expand it."""
+        self.ensure_partitions(study_partitions(name, self.project))
+        return expand_study(name, self.project)
+
     # -- worlds --------------------------------------------------------------
     def ensure_world(self, world: dict) -> dict:
         """Simulate (or reuse) one world; returns ``{status, dir, cached}``."""
@@ -205,7 +287,7 @@ class ExperimentEngine:
 
         clone = wdir / "clone"
         self._materialize_clone(clone)
-        self._write_local(clone, world["override"], world.get("globals"))
+        self._write_local(clone, world["override"], self._globals(world))
         result, seconds = self._kedro(clone)
         missing = [rel for rel in WORLD_REQUIRED
                    if not (clone / rel).exists()]
@@ -297,7 +379,7 @@ class ExperimentEngine:
                 # structure recovery); run pipelines only ADD files there.
                 _link_tree(wdir / "clone" / rel, clone / rel)
             self._write_local(clone, {**world["override"], "fl": run["fl"]},
-                              world.get("globals"))
+                              self._globals(world))
             stage_tasks = {}
             for pipeline in run["pipelines"]:
                 result, seconds = self._kedro(clone, pipeline)
@@ -423,7 +505,9 @@ def run_study(name: str, project_root: Path | str = ".", n_jobs: int = 1,
               ) -> pd.DataFrame:
     """Module-level convenience: resolve + execute a named study from
     ``conf/base/experiments.yml``."""
-    study_def = expand_study(name, Path(project_root))
-    engine = ExperimentEngine(project_root, root=study_def["root"])
+    project_root = Path(project_root)
+    root = load_studies(project_root).get("root", "data/09_experiments")
+    engine = ExperimentEngine(project_root, root=root)
+    study_def = engine.prepare_study(name)
     return engine.run_study(study_def, n_jobs=n_jobs, limit=limit,
                             dry_run=dry_run)

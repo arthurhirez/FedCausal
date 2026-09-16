@@ -8,9 +8,13 @@ from kedro.pipeline import Pipeline
 #   assessment  — a pre-flight over the NETWORK, not a world. Dozens of EPANET
 #                 solves whose answer does not change between worlds, so it is
 #                 run once per network by hand: `kedro run --pipeline assessment`.
+#   districting — the partition store, also once per network (per method):
+#                 `kedro run --pipeline districting`. Worlds READ its output
+#                 through `districts` / `partition_manifest`; the engine builds
+#                 any partition a study needs before building worlds on it.
 #   the rest    — learning/analysis stages, run per-experiment by the engine.
 _NON_DEFAULT = (
-    "assessment",
+    "assessment", "districting",
     "fl", "fl_preprocessing", "fl_training",
     "drift_detection", "dependence_detection", "drift_attribution",
     "label_factory", "automl", "personalization",
@@ -24,7 +28,8 @@ def register_pipelines() -> dict[str, Pipeline]:
         A mapping from pipeline names to ``Pipeline`` objects.
     """
     pipelines = find_pipelines(raise_errors=True)
-    # __default__ is the simulation+oracle world; FL runs via --pipeline fl
+    # __default__ is the simulation + sensor placement + oracle world; FL runs
+    # via --pipeline fl
     # (the composite would double-count its members' nodes inside a sum).
     pipelines["__default__"] = sum(
         p for name, p in pipelines.items() if name not in _NON_DEFAULT)

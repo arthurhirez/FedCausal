@@ -275,8 +275,10 @@ def build_drift_schedule(wn, districts: dict, network_profile: dict,
     # Seed precedence lives in networks.profile.resolve_seed_node and is
     # shared with experiments.spec, so a plain `kedro run` and the engine
     # cannot pick different origins: explicit scenario value (what a study
-    # writes) > the bundle's drift_seed_nodes > the auto-picker. The diffusion
-    # itself is untouched.
+    # writes) > `network_profile["drift_seed_nodes"]` > the auto-picker. The
+    # pipeline passes `partition_meta` as `network_profile`, whose seeds are
+    # the bundle's for the manual partition and empty for a generated one
+    # (networks.partitions.seed_source). The diffusion itself is untouched.
     seed_node = nprofile.resolve_seed_node(
         drift.get("seed_node"), network_profile, district,
         lambda: auto_seed_node(wn, districts, district))
@@ -284,8 +286,9 @@ def build_drift_schedule(wn, districts: dict, network_profile: dict,
         raise ValueError(
             f"drift seed_node {seed_node!r} is not a junction of {district} "
             f"on network {network_profile.get('name', '?')!r}. A seed node id "
-            "is NETWORK-SPECIFIC: check scenario.drift.seed_node, or the "
-            "bundle's profile.yml `drift_seed_nodes`.")
+            "is NETWORK- and PARTITION-specific: check scenario.drift.seed_node, "
+            "or the bundle's profile.yml `drift_seed_nodes` (honoured for the "
+            "manual partition only).")
 
     drifted = {seed_node: warmup}
     frontier = {seed_node}
