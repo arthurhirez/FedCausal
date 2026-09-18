@@ -40,6 +40,8 @@ from .specs import CLASSES, CellSpec, KINDS
 from .worlds import World
 
 __all__ = ["client_frames", "apply_transform", "build_windows",
+           "orientation", "apply_orientation", "orientation_table",
+           "channel_alignment",
            "rescale_windows", "ref_range_per_client", "assert_equal_channels",
            "window_metadata", "sensor_hash", "sensor_table", "dropped_table",
            "resolve_placement", "WindowCache", "CACHE"]
@@ -233,6 +235,101 @@ def assert_equal_channels(frames: dict[str, pd.DataFrame]) -> int:
         raise AssertionError(f"channel count differs across clients "
                              f"(breaks FedAvg): {n}")
     return next(iter(n.values()))
+
+
+# --------------------------------------------------------------------------
+# orientation (before the transform)
+# --------------------------------------------------------------------------
+def orientation(frames: dict, ref_months: int, bidir_tol: float = 0.05
+                ) -> pd.DataFrame:
+    """Per (client, slot): the sign that makes the sensor's dominant
+    direction positive.
+
+    EPANET reports a pipe flow with the sign of the pipe's own orientation,
+    so the same physical behaviour (more demand downstream) raises one
+    sensor and lowers another. With per-client MinMax that inverts the
+    demand shape on some channels only, and a FedAvg model shared across
+    clients is asked to produce opposite shapes on the same channel.
+
+    sign            sign(median over months < ref_months); +1 if the median
+                    is exactly 0
+    frac_rev_ref    share of reference steps with the opposite sign
+    frac_rev_all    the same over the whole series (drift can reverse flow)
+    bidirectional   frac_rev_ref > bidir_tol or frac_rev_all > bidir_tol:
+                    a flip does not make these one-directional -- the sign
+                    carries information there (direction of supply)
+    Pressure slots get sign +1 (they are positive by construction)."""
+    rows = []
+    for c, f in frames.items():
+        ref = f["month"].to_numpy() < ref_months
+        for x in (x for x in f.columns if x not in ("timestamp", "month")):
+            v = f[x].to_numpy(float)
+            med = float(np.median(v[ref])) if ref.any() else float(np.median(v))
+            sgn = 1.0 if med >= 0 else -1.0
+            nz = np.abs(v) > 1e-9
+            rev = (np.sign(v) == -sgn) & nz
+            fr = float(rev[ref].mean()) if ref.any() else np.nan
+            fa = float(rev.mean())
+            rows.append({"client": c, "slot": x, "median_ref": med,
+                         "sign": sgn, "frac_rev_ref": fr, "frac_rev_all": fa,
+                         "bidirectional": bool((fr > bidir_tol)
+                                               or (fa > bidir_tol))})
+    return pd.DataFrame(rows)
+
+
+def apply_orientation(frames: dict, table: pd.DataFrame) -> dict:
+    """Multiply every slot by its `sign` from `orientation`."""
+    sg = {(r.client, r.slot): r.sign for r in table.itertuples(index=False)}
+    out = {}
+    for c, f in frames.items():
+        g = f.copy()
+        for x in (x for x in g.columns if x not in ("timestamp", "month")):
+            g[x] = g[x].to_numpy(float) * sg[(c, x)]
+        out[c] = g
+    return out
+
+
+def _reference_months(world: World, spec: CellSpec) -> int:
+    warmup = world.warmup_months or int(
+        (world.fl.get("preprocessing") or {}).get("reference_months", 2))
+    return int(spec.as_fl(world.fl, reference_months=warmup)
+               ["preprocessing"]["reference_months"])
+
+
+def orientation_table(world: World, spec: CellSpec | None = None,
+                      bidir_tol: float = 0.05) -> pd.DataFrame:
+    """`orientation` on the spec's RAW frames (whether or not the spec
+    orients), joined with each slot's placement row (sensor, tier, purity,
+    second)."""
+    spec = spec or CellSpec()
+    t = orientation(client_frames(world, spec), _reference_months(world, spec),
+                    bidir_tol)
+    place = sensor_table(world, spec).rename(columns={"district": "client"})
+    keep = [c for c in ("client", "slot", "sensor", "kind", "slot_class", "tier",
+                        "purity", "second", "w_second") if c in place.columns]
+    return t.merge(place[keep], on=["client", "slot"], how="left")
+
+
+def channel_alignment(world: World, spec: CellSpec | None = None) -> pd.DataFrame:
+    """Channel index x client: what channel i is in each client.
+
+    Channels are ordered by SLOT name in every client (`client_frames`), so
+    `slot` is equal across a row by construction. What the slot does NOT
+    fix is the sensor's role (tier, purity, whom it mixes with) and its
+    flow sign -- this table puts them side by side, one row per channel,
+    one column block per client."""
+    t = orientation_table(world, spec)
+    for col, fill in (("tier", ""), ("purity", np.nan), ("second", None)):
+        if col not in t.columns:
+            t[col] = fill
+    t["channel"] = t.groupby("client").cumcount()
+    t["role"] = [f"{s} · {tr} · p{p:.2f}" + (f" · +{sec}" if isinstance(sec, str)
+                                               else "")
+                 + f" · {'+' if g > 0 else '-'}" + (" · bidir" if b else "")
+                 for s, tr, p, sec, g, b in zip(
+                     t["slot"], t["tier"], t["purity"], t["second"],
+                     t["sign"], t["bidirectional"])]
+    return t.pivot(index="channel", columns="client", values="role")
 
 
 # --------------------------------------------------------------------------
@@ -438,14 +535,20 @@ def build_windows(world: World, spec: CellSpec, clients=None,
     to fit inside it: a scaler fitted past the first node switch would have
     seen the drift it is supposed to make visible.
     """
-    if cache is not None:
-        hit = cache.get(world, spec, clients)
-        if hit is not None:
-            return hit
-
+    # `fl` is ALWAYS rebuilt from this spec. The cache holds windows and
+    # scalers only: it is keyed on the upstream part of the spec, so a cached
+    # `fl` would hand the training / model blocks of whichever spec filled
+    # the entry to every later spec with the same windows (the bug that made
+    # 30-round cells train for 5).
     warmup = world.warmup_months or int(
         (world.fl.get("preprocessing") or {}).get("reference_months", 2))
     fl = spec.as_fl(world.fl, reference_months=warmup)
+    if cache is not None:
+        hit = cache.get(world, spec, clients)
+        if hit is not None:
+            fw, scalers = hit
+            return fw, scalers, fl
+
     ref_m = int(fl["preprocessing"]["reference_months"])
     first = world.first_switch
     if first is not None and ref_m > first:
@@ -458,6 +561,8 @@ def build_windows(world: World, spec: CellSpec, clients=None,
     if clients:
         frames = {c: frames[c] for c in clients}
     assert_equal_channels(frames)
+    if spec.orient:
+        frames = apply_orientation(frames, orientation(frames, ref_m))
     frames = apply_transform(frames, spec.transform, world.steps_day)
 
     fw, scalers, _report = preprocess_clients(frames, fl, world.time)
@@ -465,7 +570,7 @@ def build_windows(world: World, spec: CellSpec, clients=None,
     fw = rescale_windows(fw, scalers, spec.scaling, fl)
 
     if cache is not None:
-        cache.put(world, spec, clients, (fw, scalers, fl))
+        cache.put(world, spec, clients, (fw, scalers))
     return fw, scalers, fl
 
 
@@ -493,7 +598,8 @@ def window_metadata(world: World, fl_windows: dict) -> pd.DataFrame:
 # cache
 # --------------------------------------------------------------------------
 class WindowCache:
-    """Bounded LRU over `(world, spec-upstream, clients)` -> windows.
+    """Bounded LRU over `(world, spec-upstream, clients)` -> (windows,
+    scalers). Never the resolved `fl`: that depends on the whole spec.
 
     Explicit and bounded on purpose: the notebooks kept a module-level dict,
     so a stray widget interaction could silently reprocess a world and grow
@@ -513,6 +619,7 @@ class WindowCache:
                 tuple(sorted(spec.classes)), tuple(sorted(spec.include)),
                 tuple(sorted(spec.exclude)),
                 spec.transform, spec.scaling, bool(spec.noise), spec.cap,
+                bool(spec.orient),
                 g.interval_agg_h, g.window_size, g.step_size,
                 g.reference_months, g.label_threshold,
                 tuple(g.feature_range), tuple(clients or ()))

@@ -33,14 +33,16 @@ import time
 
 import pandas as pd
 
-from .specs import CLASSES, CellSpec, Geometry, ModelCfg, TrainCfg
+from .specs import (CLASSES, CellSpec, Geometry, LossTerms, ModelCfg,
+                    Schedule, TrainCfg)
 from .worlds import World
 
 __all__ = ["Store", "RUN_TABLES"]
 
 RUN_TABLES = ("prototype_history", "global_prototype_history",
               "latents_by_round", "latent_trajectories", "prototypes",
-              "drift_signals", "update_gram")
+              "drift_signals", "update_gram",
+               "prequential", "latent_trajectories_preq")
 
 _INDEX_COLS = ["world_hash", "run_key", "label", "tag", "network",
                "districting", "placement_source", "kinds", "classes",
@@ -70,6 +72,13 @@ def _read_table(base: pathlib.Path):
     return None
 
 
+def _schedule_from_dict(d: dict) -> Schedule:
+    kw = dict(d)
+    if kw.get("months") is not None:
+        kw["months"] = tuple(kw["months"])
+    return Schedule(**kw)
+
+
 def _spec_from_dict(d: dict) -> CellSpec:
     """Rebuild a `CellSpec` from `spec.json` -- so a cached run is re-runnable."""
     g, m, t = d["geometry"], d["model"], d["training"]
@@ -93,7 +102,8 @@ def _spec_from_dict(d: dict) -> CellSpec:
                           proto_alpha=t["proto_alpha"],
                           infonce_temperature=t["infonce_temperature"],
                           fl_seed=t.get("seed", 0),
-                          device=t.get("device", "auto")),
+                          device=t.get("device", "auto"),
+                          proto_weight=t.get("proto_weight")),
         noise=bool(d.get("noise", False)), cap=d.get("cap"),
         # `.get(..., default)`: spec.json files saved before this fix don't
         # have these keys; they fall back to CellSpec's own defaults, which
@@ -104,7 +114,12 @@ def _spec_from_dict(d: dict) -> CellSpec:
                          if isinstance(d.get("snapshot_rounds"), list)
                          else d.get("snapshot_rounds", "sparse")),
         snapshot_points=int(d.get("snapshot_points", 1500)),
-        keep_weights=d.get("keep_weights", "final"))
+        keep_weights=d.get("keep_weights", "final"),
+        loss_terms=(LossTerms(**d["loss_terms"]) if d.get("loss_terms")
+                    else None),
+        orient=bool(d.get("orient") or False),
+        schedule=(_schedule_from_dict(d["schedule"]) if d.get("schedule")
+                  else None))
 
 
 class Store:
@@ -177,7 +192,10 @@ class Store:
                   "latent_trajectories": res.get("latent_trajectories"),
                   "prototypes": res.get("prototypes"),
                   "drift_signals": res.get("drift_signals"),
-                  "update_gram": res.get("update_gram")}
+                  "update_gram": res.get("update_gram"),
+                  # schedules only
+                  "prequential": res.get("prequential"),
+                  "latent_trajectories_preq": res.get("latent_trajectories_preq")}
         for name, df in tables.items():
             if df is not None and len(df):
                 _write_table(df, out / name)
@@ -234,18 +252,83 @@ class Store:
         return out
 
     def load_model(self, world_hash: str, run_key: str, client: str = "global"):
-        """Rebuild an `AER` with the saved weights (final round)."""
+        """Rebuild an `AER` with the saved weights (final round).
+
+        `client="global"`: the FedAvg model. `client=<district>`: that
+        client's LOCAL weights after its last local update, before the final
+        FedAvg -- only in runs whose meta says
+        `client_weights == "local_pre_fedavg"`; older runs saved the synced
+        global weights under every client name, so asking for a client there
+        raises instead of silently returning the global model."""
         import torch
         from . import bridge
         d = self.run_dir(world_hash, run_key)
         state = torch.load(d / "fed_model.pt", map_location="cpu",
                            weights_only=False)
         m = state["meta"]
+        if client != "global" and m.get("client_weights") != "local_pre_fedavg":
+            raise ValueError(
+                f"run {run_key} has no local weights (saved before they were "
+                f"kept) -- retrain it with run_cell(..., overwrite=True)")
         mdl = bridge.aer_class()(m["n_features"], m["window_size"],
                                  m["lstm_units"])
         mdl.load_state_dict(state[client])
         mdl.eval()
         return mdl
+
+    # ---------------------------------------------------------------- audit
+    def audit(self, world_hash: str | None = None) -> pd.DataFrame:
+        """Every saved run: does its `fl.json` (what actually trained) agree
+        with its `spec.json` (what the key says)? One row per run;
+        `mismatch` lists the disagreeing fields, `ok` is False when any do.
+
+        Runs saved while `data.build_windows` cached `fl` can carry another
+        spec's training / model blocks under their own key."""
+        from .train import fl_mismatches
+        base = self.root / "runs"
+        dirs = ([base / world_hash] if world_hash else
+                [d for d in base.iterdir() if d.is_dir()])
+        rows = []
+        for wd in dirs:
+            if not wd.is_dir():
+                continue
+            for rd in sorted(p for p in wd.iterdir() if p.is_dir()):
+                row = {"world_hash": wd.name, "run_key": rd.name}
+                try:
+                    spec = _spec_from_dict(json.loads((rd / "spec.json").read_text()))
+                    fl = json.loads((rd / "fl.json").read_text())
+                    bad = fl_mismatches(spec, fl)
+                    row.update(label=spec.label(),
+                               rounds_spec=spec.training.rounds,
+                               rounds_fl=(fl.get("training") or {}).get("rounds"),
+                               epochs_spec=spec.training.local_epochs,
+                               epochs_fl=(fl.get("training") or {}).get("local_epochs"),
+                               mismatch="; ".join(f"{k}: spec={a} fl={b}"
+                                                  for k, (a, b) in bad.items()),
+                               ok=not bad)
+                except Exception as exc:          # unreadable run
+                    row.update(label=None, mismatch=f"unreadable: {exc}", ok=False)
+                rows.append(row)
+        return pd.DataFrame(rows)
+
+    def purge(self, world_hash: str, run_keys) -> list[str]:
+        """Delete these runs (directory + index row). Returns what was removed.
+        Only ever called explicitly -- nothing in the package purges on its
+        own."""
+        import shutil
+        removed = []
+        for key in run_keys:
+            d = self.run_dir(world_hash, key)
+            if d.exists():
+                shutil.rmtree(d)
+                removed.append(key)
+        p = self.index_path
+        if removed and p.exists():
+            reg = pd.read_csv(p)
+            reg = reg[~((reg["world_hash"] == world_hash)
+                        & (reg["run_key"].isin(removed)))]
+            reg.to_csv(p, index=False)
+        return removed
 
     def index(self, world_hash: str | None = None) -> pd.DataFrame:
         p = self.index_path

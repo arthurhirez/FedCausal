@@ -153,19 +153,24 @@ studies:
       fixed:
         network: ky72                 # the bundle directory under data/01_raw
         sim_seed: 42
-        n_months: 55                 # >= 59: probes need warm-up 12 + seed
+        n_months: 65                 # >= 59: probes need warm-up 12 + seed
                                      # eccentricity (<= 32 hops on these cuts)
                                      # + ramp 2 + pad 1 + 12 settled months
         days_per_month: 14
         seasonality_scale: 0.0       # 0.0 turns it off for world AND probes
         drift_ramp_days: 7
+
         anchor_scale: 0.50
         beta: 0.35
         consumption_map: LR_LR_LR_LR # e.g. LR_MC_HI_LM; District_A's token
                                      # must differ from the drift target (LI)
         coupling: {variant: baseline, close_fraction: 0.0}
-        drift: {tgt_district: District_A, warmup_months: 12, to_income: low, to_land_use: industrial}
+        drift: {max_neighbors_per_month: 6, tgt_district: District_A, warmup_months: 12, to_income: low, to_land_use: industrial}
         placement:
+          source: dynamic             # dynamic | manual (profile `sensors:`)
+          slots:                      # identical for every district
+            flow:     {pure: 2, mixed: 2}
+            pressure: {pure: 2, mixed: 2}        
           probe: {horizon: world, seasonality: world, diffusion: planned}
         oracle:
           tiers: [1, 4]
@@ -173,12 +178,52 @@ studies:
           n_surrogates_expensive: 8
           minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
       grid:
-        districting: [spectral, girvan_newman, fast_greedy]
+        districting: [spectral, girvan_newman] #fast_greedy
     runs:
       fixed: {rounds: 8}
     pipelines: []
     harvest: [validation]
 
+
+
+  ky72_districting_probe_V2:
+    description: >
+      KY7 baseline world on three generated partitions, dynamic sensors,
+      probes on the world's grid with seasonality. Worlds only; FL not run.
+    worlds:
+      fixed:
+        network: ky72                 # the bundle directory under data/01_raw
+        sim_seed: 42
+        n_months: 70                 # >= 59: probes need warm-up 12 + seed
+                                     # eccentricity (<= 32 hops on these cuts)
+                                     # + ramp 2 + pad 1 + 12 settled months
+        days_per_month: 14
+        seasonality_scale: 0.0       # 0.0 turns it off for world AND probes
+        drift_ramp_days: 7
+
+        anchor_scale: 0.50
+        beta: 0.35
+        consumption_map: LR_LR_LC_LI # e.g. LR_MC_HI_LM; District_A's token
+                                     # must differ from the drift target (LI)
+        coupling: {variant: baseline, close_fraction: 0.0}
+        drift: {max_neighbors_per_month: 8, tgt_district: District_A, warmup_months: 12, to_income: low, to_land_use: industrial}
+        placement:
+          source: dynamic             # dynamic | manual (profile `sensors:`)
+          slots:                      # identical for every district
+            flow:     {pure: 2, mixed: 2}
+            pressure: {pure: 2, mixed: 2}        
+          probe: {horizon: world, seasonality: world, diffusion: planned}
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+      grid:
+        districting: [spectral, girvan_newman] #fast_greedy
+    runs:
+      fixed: {rounds: 8}
+    pipelines: []
+    harvest: [validation]
   # ---------------------------------------------- D-Town component probe --
   # FIRST STUDY ON A NETWORK WHERE PUMPS AND VALVES ARE LOAD-BEARING: 11 pumps
   # on 3-point HEAD curves, 5 valves (4 PRV + 1 TCV), 24 controls, 7 tanks.

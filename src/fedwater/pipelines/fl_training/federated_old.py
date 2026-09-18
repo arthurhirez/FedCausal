@@ -157,15 +157,6 @@ class FPLTrainer:
         }
         self.global_protos: dict = {}
         self.rng = np.random.default_rng(seed)
-        # Weight of the FPL prototype loss in the local objective. Absent /
-        # null keeps the protocol's own `loss_mse + loss_proto` (weight 1.0,
-        # bit-identical). 0.0 trains on reconstruction alone; prototypes are
-        # still extracted and aggregated every round (drift and similarity
-        # read them), only their gradient is dropped.
-        pw = self.cfg_t.get("proto_weight")
-        self.proto_weight = 1.0 if pw is None else float(pw)
-        if self.proto_weight < 0:
-            raise ValueError(f"fl.training.proto_weight must be >= 0, got {pw}")
 
         self.local_proto_rows: list[dict] = []
         self.global_proto_rows: list[dict] = []
@@ -194,9 +185,8 @@ class FPLTrainer:
                 loss_proto = (hierarchical_proto_loss(
                     z, lb, self.global_protos, self.cfg_t["proto_alpha"],
                     self.cfg_t["infonce_temperature"], self.device)
-                    if self.global_protos and self.proto_weight != 0.0
-                    else torch.zeros((), device=self.device))
-                loss = loss_mse + self.proto_weight * loss_proto
+                    if self.global_protos else torch.zeros((), device=self.device))
+                loss = loss_mse + loss_proto
                 loss.backward()
                 opt.step()
                 s_tot += loss.item()

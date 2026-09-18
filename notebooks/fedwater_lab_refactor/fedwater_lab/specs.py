@@ -20,7 +20,8 @@ from dataclasses import dataclass, field, replace
 from typing import Sequence
 
 __all__ = ["CLASSES", "TRANSFORMS", "SCALINGS", "KINDS", "Geometry",
-           "ModelCfg", "TrainCfg", "CellSpec", "POC", "expand"]
+           "ModelCfg", "TrainCfg", "LossTerms", "Schedule", "CellSpec",
+           "POC", "expand"]
 
 # Which SLOTS a spec draws from (`sensor_placement.csv`'s `slot_class`).
 # `manual` is not a class to filter on -- it is the world's own placement
@@ -113,8 +114,19 @@ class TrainCfg:
     infonce_temperature: float = 0.02
     fl_seed: int = 0
     device: str = "auto"
+    # UPSTREAM knob (`fl.training.proto_weight`, read by `FPLTrainer`):
+    # weight of the FPL prototype loss. None = not set = the protocol's own
+    # weight 1.0, and the key is left out of the spec entirely, so every run
+    # key computed before this field existed is unchanged.
+    proto_weight: float | None = None
 
     def as_fl(self) -> dict:
+        out = self._as_fl()
+        if self.proto_weight is not None:
+            out["proto_weight"] = float(self.proto_weight)
+        return out
+
+    def _as_fl(self) -> dict:
         return {"rounds": int(self.rounds),
                 "local_epochs": int(self.local_epochs),
                 "learning_rate": float(self.learning_rate),
@@ -125,6 +137,111 @@ class TrainCfg:
                 "infonce_temperature": float(self.infonce_temperature),
                 "seed": int(self.fl_seed),
                 "device": str(self.device)}
+
+
+@dataclass(frozen=True)
+class LossTerms:
+    """LAB-SIDE local objective (`train.SnapshotFPLTrainer` re-implements
+    `FPLTrainer._local_update` when a spec carries one; None = upstream loop).
+
+        loss = aer_loss
+             + proto_weight * proto_loss        (from round `proto_start`)
+             + diff * MSE(d/dt dec, d/dt x)      over the full window
+             + spec * MSE(|F dec_y|, |F x_y|)    FFT magnitudes, steps 1..W-2,
+                                                 per-window mean removed,
+                                                 orthonormal (Parseval scale)
+             + var  * mean_d relu(var_gamma - std_batch(z_d))
+
+    `diff` and `spec` penalise exactly what the flat-line minimum loses (the
+    within-window swing); a flat output pays the target's full derivative /
+    spectral energy. `var` is the VICReg variance hinge: it keeps each latent
+    dimension's batch spread above `var_gamma`, against the prototype term's
+    pull of every window onto its month mean. `LossTerms()` reproduces the
+    upstream objective exactly (asserted by the lab's equivalence check).
+    """
+
+    proto_weight: float = 1.0
+    proto_start: int = 1
+    diff: float = 0.0
+    spec: float = 0.0
+    var: float = 0.0
+    var_gamma: float = 0.1
+
+    def __post_init__(self):
+        for k in ("proto_weight", "diff", "spec", "var", "var_gamma"):
+            if getattr(self, k) < 0:
+                raise ValueError(f"LossTerms.{k} must be >= 0")
+        if self.proto_start < 0:
+            raise ValueError("LossTerms.proto_start must be >= 0")
+
+    def as_dict(self) -> dict:
+        return {"proto_weight": float(self.proto_weight),
+                "proto_start": int(self.proto_start),
+                "diff": float(self.diff), "spec": float(self.spec),
+                "var": float(self.var), "var_gamma": float(self.var_gamma)}
+
+    def label(self) -> str:
+        d = LossTerms().as_dict()
+        parts = [f"{k[0]}{v:g}" if k != "proto_start" else f"ps{v}"
+                 for k, v in self.as_dict().items()
+                 if v != d[k] and k != "var_gamma"]
+        if self.var and self.var_gamma != d["var_gamma"]:
+            parts.append(f"g{self.var_gamma:g}")
+        return "L" + ("-".join(parts) if parts else "default")
+
+
+@dataclass(frozen=True)
+class Schedule:
+    """WHEN the model sees which months. None on a spec = the default: every
+    month at once, every round (what POC_02 trains).
+
+    mode="commissioning"  train only on months [lo, hi] (`months`), then
+        freeze. The rest of the horizon is only ever ENCODED, so the model
+        never sees the drift -- the realistic counterpart of a scaler fitted
+        on the commissioning period. `rounds` / `local_epochs` still come
+        from `training`.
+    mode="streaming"  prequential: the horizon is cut into blocks of
+        `block_months`; for each block in order the CURRENT model is scored
+        on it first (unseen), then trained on it for `rounds_per_block`
+        rounds, carrying the global and local weights and the global
+        prototypes forward. Adam state restarts each block.
+
+    `warm_months` (streaming) trains the first block for `warm_rounds`
+    instead, so the model does not enter block 1 untrained.
+    """
+
+    mode: str = "commissioning"
+    months: tuple[int, int] | None = None      # commissioning: inclusive
+    block_months: int = 6                      # streaming
+    rounds_per_block: int = 5                  # streaming
+    warm_rounds: int | None = None             # streaming: first block
+
+    def __post_init__(self):
+        if self.mode not in ("commissioning", "streaming"):
+            raise KeyError(f"schedule mode {self.mode!r}")
+        if self.mode == "commissioning":
+            if self.months is None or len(self.months) != 2:
+                raise ValueError("commissioning needs months=(lo, hi)")
+            if self.months[0] > self.months[1]:
+                raise ValueError(f"months out of order: {self.months}")
+        if self.block_months < 1 or self.rounds_per_block < 1:
+            raise ValueError("block_months and rounds_per_block must be >= 1")
+
+    def as_dict(self) -> dict:
+        d = {"mode": self.mode,
+             "months": None if self.months is None else list(self.months)}
+        if self.mode == "streaming":
+            d.update(block_months=int(self.block_months),
+                     rounds_per_block=int(self.rounds_per_block),
+                     warm_rounds=(None if self.warm_rounds is None
+                                  else int(self.warm_rounds)))
+        return d
+
+    def label(self) -> str:
+        if self.mode == "commissioning":
+            return f"C{self.months[0]}-{self.months[1]}"
+        w = "" if self.warm_rounds is None else f"w{self.warm_rounds}"
+        return f"S{self.block_months}x{self.rounds_per_block}{w}"
 
 
 @dataclass(frozen=True)
@@ -165,6 +282,13 @@ class CellSpec:
     snapshot_rounds: str | tuple[int, ...] = "sparse"   # sparse|all|explicit
     snapshot_points: int = 1500
     keep_weights: str = "final"          # final|none|all_rounds
+    loss_terms: LossTerms | None = None  # None = upstream `_local_update`
+    # Flip each flow sensor so its dominant direction over the reference
+    # months is positive (`data.orientation`). Applied client-side, before
+    # the transform and the scaler. False = the raw EPANET sign (pipe
+    # orientation), and the key is left out of the spec.
+    orient: bool = False
+    schedule: Schedule | None = None     # None = all months, every round
 
     # ------------------------------------------------------------ validation
     def __post_init__(self):
@@ -223,7 +347,14 @@ class CellSpec:
                                     if not isinstance(self.snapshot_rounds, str)
                                     else self.snapshot_rounds),
                 "snapshot_points": int(self.snapshot_points),
-                "keep_weights": self.keep_weights}
+                "keep_weights": self.keep_weights,
+                # None is dropped by `_norm`, so specs without a lab loss hash
+                # exactly as before this field existed.
+                "loss_terms": (None if self.loss_terms is None
+                               else self.loss_terms.as_dict()),
+                "orient": True if self.orient else None,
+                "schedule": (None if self.schedule is None
+                             else self.schedule.as_dict())}
 
     def key(self, world_hash: str, sensor_hash: str = "") -> str:
         """Deterministic run key: 12 hex chars over the normalized spec.
@@ -247,10 +378,16 @@ class CellSpec:
                 json.dumps([sorted(self.include), sorted(self.exclude)],
                           separators=(",", ":")).encode()).hexdigest()[:6]
             ov = f"~{digest}"
-        return (f"{ch}{cl}{ov}__{self.transform}__{self.scaling}"
+        tr = self.training
+        ep = f"e{tr.local_epochs}" if tr.local_epochs != 1 else ""
+        pw = f"pw{tr.proto_weight:g}" if tr.proto_weight is not None else ""
+        lt = f"__{self.loss_terms.label()}" if self.loss_terms is not None else ""
+        lt += f"__{self.schedule.label()}" if self.schedule is not None else ""
+        tf = self.transform + ("+or" if self.orient else "")
+        return (f"{ch}{cl}{ov}__{tf}__{self.scaling}"
                 f"__{self.geometry.label()}"
-                f"__u{self.model.lstm_units}r{self.training.rounds}"
-                f"s{self.training.fl_seed}")
+                f"__u{self.model.lstm_units}r{tr.rounds}{ep}{pw}"
+                f"s{tr.fl_seed}{lt}")
 
     def with_(self, **kw) -> "CellSpec":
         """Copy with overrides; nested blocks by dotted key.

@@ -4,6 +4,16 @@
 only adds observation. Three additions over what the two notebooks had, all
 mechanical:
 
+0. **An optional lab-side local objective** (`spec.loss_terms`, see
+   `specs.LossTerms`). With it, `_local_update` is RE-IMPLEMENTED here
+   (`_local_update_lab`): same seeding, loader, epochs, prototype extraction
+   and log schema as upstream, plus the extra terms. This is the one
+   deliberate exception to "nothing upstream is re-implemented", and
+   `LossTerms()` must reproduce the upstream loop bit for bit
+   (`equivalence_check`). Without `loss_terms` the upstream loop runs
+   untouched; the upstream knob `fl.training.proto_weight` then applies
+   (needs the patched `FPLTrainer`; refused otherwise).
+
 1. **Month-stratified snapshots.** Both notebooks sampled the snapshot subset
    with `rng.choice` over all of a client's windows, so the label-clean init
    months got roughly their share of the timeline -- a handful of points in
@@ -44,7 +54,8 @@ from .worlds import World
 __all__ = ["resolve_device", "snapshot_rounds_for", "SnapshotFPLTrainer",
            "run_cell", "compile_prototypes", "fedavg_gap",
            "assert_determinism", "reconstruction_model", "decode",
-           "reconstruct_prototypes"]
+           "reconstruct_prototypes", "untrained_model", "equivalence_check",
+           "fl_mismatches", "assert_fl_matches", "local_model"]
 
 
 def resolve_device(name: str = "auto") -> str:
@@ -113,8 +124,23 @@ def _make_trainer_class():
 
         def __init__(self, client_windows, fl, seed, *, rounds: int,
                      snapshot_rounds="sparse", points: int = 1500,
-                     verbose: bool = False):
+                     verbose: bool = False, loss_terms=None):
             super().__init__(client_windows, fl, seed)
+            pw = (fl.get("training") or {}).get("proto_weight")
+            if pw is not None and loss_terms is not None:
+                raise ValueError("set the prototype weight in ONE place: "
+                                 "training.proto_weight (upstream) or "
+                                 "loss_terms.proto_weight (lab), not both")
+            if pw is not None and not hasattr(self, "proto_weight"):
+                raise RuntimeError(
+                    "fl.training.proto_weight is set but the installed "
+                    "FPLTrainer does not read it -- apply the fl_training/"
+                    "federated.py patch, or use spec.loss_terms instead")
+            self.loss_terms = loss_terms
+            # each client's weights right after its latest local update,
+            # BEFORE FedAvg overwrites them (the model its shared prototypes
+            # came from)
+            self.local_states: dict = {}
             flatten_rnn_weights(self.global_model, *self.models.values())
             self.starts = {c: np.asarray(client_windows[c]["window_start_step"])
                            for c in self.clients}
@@ -180,8 +206,88 @@ def _make_trainer_class():
             self.snap_rows.append(df)
 
         # ------------------------------------------------------------ hooks
+        def _local_update_lab(self, client: str, round_idx: int):
+            """`FPLTrainer._local_update` with `self.loss_terms` applied.
+            Kept line-for-line parallel to upstream; see the module note."""
+            from torch.utils.data import DataLoader, TensorDataset
+            lt, cfg = self.loss_terms, self.cfg_t
+            model, opt = self.models[client], self.optimizers[client]
+            windows, labels = self.data[client]
+            gen = torch.Generator().manual_seed(
+                int(np.random.default_rng([self.seed, round_idx,
+                                           self.clients.index(client)])
+                    .integers(2**31)))
+            loader = DataLoader(TensorDataset(windows, labels),
+                                batch_size=cfg["batch_size"],
+                                shuffle=True, generator=gen)
+            use_proto = (bool(self.global_protos) and lt.proto_weight != 0
+                         and round_idx >= lt.proto_start)
+            zero = torch.zeros((), device=self.device)
+            mse = torch.nn.functional.mse_loss
+            model.train()
+            for epoch in range(cfg["local_epochs"]):
+                sums = dict.fromkeys(("loss", "loss_mse", "loss_proto",
+                                      "loss_diff", "loss_spec", "loss_var"),
+                                     0.0)
+                for wb, lb in loader:
+                    opt.zero_grad()
+                    x, ry_t, y_t, fy_t = bridge.split_window_targets(wb)
+                    ry, y, fy, z = model(x)
+                    loss_mse = bridge.aer_loss(ry, y, fy, ry_t, y_t, fy_t,
+                                               self.cfg_m["reg_ratio"])
+                    loss_proto = (bridge.hierarchical_proto_loss(
+                        z, lb, self.global_protos, cfg["proto_alpha"],
+                        cfg["infonce_temperature"], self.device)
+                        if use_proto else zero)
+                    loss = loss_mse + lt.proto_weight * loss_proto
+                    l_diff = l_spec = l_var = zero
+                    if lt.diff:
+                        dec = torch.cat([ry.unsqueeze(1), y, fy.unsqueeze(1)], 1)
+                        l_diff = mse(torch.diff(dec, dim=1),
+                                     torch.diff(wb, dim=1))
+                        loss = loss + lt.diff * l_diff
+                    if lt.spec:
+                        def mag(a):
+                            a = a - a.mean(dim=1, keepdim=True)
+                            return torch.fft.rfft(a, dim=1, norm="ortho").abs()
+                        l_spec = mse(mag(y), mag(y_t))
+                        loss = loss + lt.spec * l_spec
+                    if lt.var:
+                        sd = torch.sqrt(z.var(dim=0) + 1e-4)
+                        l_var = torch.relu(lt.var_gamma - sd).mean()
+                        loss = loss + lt.var * l_var
+                    loss.backward()
+                    opt.step()
+                    sums["loss"] += loss.item()
+                    sums["loss_mse"] += loss_mse.item()
+                    sums["loss_proto"] += float(loss_proto.detach())
+                    sums["loss_diff"] += float(l_diff.detach())
+                    sums["loss_spec"] += float(l_spec.detach())
+                    sums["loss_var"] += float(l_var.detach())
+                n = len(loader)
+                self.log_rows.append(dict(round=round_idx, client=client,
+                                          epoch=epoch,
+                                          **{k: v / n for k, v in sums.items()}))
+
+            protos = bridge.extract_prototypes(model, windows,
+                                               labels.cpu().numpy(),
+                                               cfg["batch_size"])
+            for m, p in protos.items():
+                if not np.isfinite(p).all():
+                    raise AssertionError(f"Non-finite prototype: {client} month {m}")
+                self.local_proto_rows.append(
+                    dict(round=round_idx, client=client, month=m,
+                         **{f"f{i}": v for i, v in enumerate(p)}))
+            return protos
+
         def _local_update(self, client: str, round_idx: int):
-            protos = super()._local_update(client, round_idx)
+            if self.loss_terms is None:
+                protos = super()._local_update(client, round_idx)
+            else:
+                protos = self._local_update_lab(client, round_idx)
+            self.local_states[client] = {
+                k: v.detach().cpu().clone()
+                for k, v in self.models[client].state_dict().items()}
             if round_idx in self.snap_rounds:
                 self._snapshot(client, round_idx, "pre")
             return protos
@@ -341,6 +447,68 @@ def fedavg_gap(prototypes: pd.DataFrame, round_idx: int | None = None) -> float:
 # --------------------------------------------------------------------------
 # the entry point
 # --------------------------------------------------------------------------
+_CONTRACT_TRAINING = ("rounds", "local_epochs", "learning_rate", "batch_size",
+                      "participation", "averaging", "proto_alpha",
+                      "infonce_temperature", "seed", "proto_weight")
+_CONTRACT_MODEL = ("lstm_units", "reg_ratio")
+
+
+def fl_mismatches(spec: CellSpec, fl: dict) -> dict:
+    """{key: (spec value, fl value)} for every training / model / geometry
+    field where a resolved `fl` disagrees with the spec it should come from."""
+    want_t, want_m = spec.training.as_fl(), spec.model.as_fl()
+    got_t, got_m = fl.get("training") or {}, fl.get("model") or {}
+    out = {}
+    for k in _CONTRACT_TRAINING:
+        a, b = want_t.get(k), got_t.get(k)
+        if a != b and not (a is None and b is None):
+            out[f"training.{k}"] = (a, b)
+    for k in _CONTRACT_MODEL:
+        if want_m.get(k) != got_m.get(k):
+            out[f"model.{k}"] = (want_m.get(k), got_m.get(k))
+    g, pre = spec.geometry, fl.get("preprocessing") or {}
+    for k in ("interval_agg_h", "window_size", "step_size"):
+        if int(getattr(g, k)) != int(pre.get(k, -1)):
+            out[f"preprocessing.{k}"] = (getattr(g, k), pre.get(k))
+    return out
+
+
+def assert_fl_matches(spec: CellSpec, fl: dict) -> None:
+    bad = fl_mismatches(spec, fl)
+    if bad:
+        raise AssertionError(f"resolved fl disagrees with the spec: {bad}")
+
+
+def _run_meta(fl, tr, fl_windows, spec, seed, rounds, snapshot_rounds):
+    """The `meta` block of a run: enough to rebuild the model and to say
+    what produced it. Shared by every schedule."""
+    return {"lstm_units": fl["model"]["lstm_units"],
+            # The spec keeps the literal "auto" so run keys stay
+            # portable across machines; the RESOLVED device is
+            # recorded here, because CPU and GPU do not agree to the
+            # last digit and a cache hit should say which produced it.
+            "device": fl["training"]["device"],
+            "torch": torch.__version__,
+            "window_size": tr.global_model.window_size,
+            "n_features": tr.global_model.head.out_features,
+            "latent_dim": tr.global_model.latent_dim,
+            "sensors": fl_windows[next(iter(fl_windows))]["sensors"],
+            "clients": list(tr.clients), "seed": seed,
+            "rounds": rounds,
+            "snapshot_rounds": snapshot_rounds,
+            "client_weights": "local_pre_fedavg",
+            # windows the trainer actually saw (a commissioning or streaming
+            # schedule trains on a slice); `tr.data` is {client: (X, labels)}
+            "train_windows": (float(np.mean([len(v[1]) for v in tr.data.values()]))
+                              if getattr(tr, "data", None) else None),
+            "orient": bool(spec.orient),
+            "schedule": (None if spec.schedule is None
+                         else spec.schedule.as_dict()),
+            "proto_weight": getattr(tr, "proto_weight", None),
+            "loss_terms": (None if spec.loss_terms is None
+                           else spec.loss_terms.as_dict())}
+
+
 def run_cell(world: World, spec: CellSpec, fl_windows=None, scalers=None,
              fl=None, cache=None, verbose: bool = False) -> dict:
     """Train one cell. Pure compute -- persistence lives in `store`.
@@ -357,21 +525,58 @@ def run_cell(world: World, spec: CellSpec, fl_windows=None, scalers=None,
         fl_windows, scalers, fl = D.build_windows(world, spec, cache=cache)
 
     fl = copy.deepcopy(fl)
+    assert_fl_matches(spec, fl)
     fl["training"]["device"] = resolve_device(fl["training"].get("device"))
     rounds = int(fl["training"]["rounds"])
     seed = bridge.effective_fl_seed(fl, int(world.params.get("seed", 42)))
 
+    sch = spec.schedule
+    if sch is not None and sch.mode == "streaming":
+        from . import streaming as ST
+        out = ST.run_stream(world, spec, fl_windows, fl, seed, verbose=verbose)
+        tr = out.pop("trainer")
+        out["meta"] = _run_meta(fl, tr, fl_windows, spec, seed,
+                               out.pop("rounds_total"),
+                               sorted(getattr(tr, "snap_rounds", ()) or ()))
+        out["meta"]["blocks"] = out["blocks"].to_dict("records")
+        out["fl"], out["seconds"] = fl, out.get("seconds")
+        return out
+
+    train_windows = fl_windows
+    if sch is not None and sch.mode == "commissioning":
+        from . import streaming as ST
+        train_windows = ST.filter_windows(fl_windows, *sch.months)
+        missing = set(fl_windows) - set(train_windows)
+        if missing:
+            raise AssertionError(f"no windows in months {sch.months} for "
+                                 f"{sorted(missing)}: FedAvg needs every client")
+        if verbose:
+            n = {c: len(d["labels"]) for c, d in train_windows.items()}
+            print(f"commissioning on months {sch.months[0]}..{sch.months[1]}: "
+                  f"{n} windows per client")
+
     t0 = time.time()
-    tr = SnapshotFPLTrainer(fl_windows, fl, seed, rounds=rounds,
+    tr = SnapshotFPLTrainer(train_windows, fl, seed, rounds=rounds,
                             snapshot_rounds=spec.snapshot_rounds,
-                            points=spec.snapshot_points, verbose=verbose)
+                            points=spec.snapshot_points, verbose=verbose,
+                            loss_terms=spec.loss_terms)
     tr.train(rounds)
     seconds = round(time.time() - t0, 1)
 
     ph = pd.DataFrame(tr.local_proto_rows)
     gph = pd.DataFrame(tr.global_proto_rows)
     log = pd.DataFrame(tr.log_rows)
-    lt = tr.latent_trajectories(fl_windows)
+    # ALWAYS every window, even when training saw only some of them: the
+    # analysis encodes the whole horizon through the trained model.
+    # `FPLTrainer.latent_trajectories` can only encode the windows it was
+    # built with, so a commissioning run goes through `encode_windows`
+    # (same schema, global weights -- after FedAvg every client model is
+    # the global one).
+    if train_windows is fl_windows:
+        lt = tr.latent_trajectories(fl_windows)
+    else:
+        from .aligned import encode_windows
+        lt = encode_windows(tr.global_model, fl_windows)
     snaps = tr.snapshots()
 
     for name, df in (("prototype_history", ph), ("latent_trajectories", lt)):
@@ -387,22 +592,13 @@ def run_cell(world: World, spec: CellSpec, fl_windows=None, scalers=None,
             "snapshots": snaps, "update_gram": tr.update_gram(),
             "prototypes": compile_prototypes(ph, gph, snaps, lt),
             "drift_signals": bridge.compute_drift_signals(ph, fl),
+            # client entries are LOCAL (pre-final-FedAvg) weights; after
+            # FedAvg `tr.models[c]` would just be the global model again
             "models": {"global": tr.global_model.state_dict(),
-                       **{c: tr.models[c].state_dict() for c in tr.clients}},
-            "meta": {"lstm_units": fl["model"]["lstm_units"],
-                     # The spec keeps the literal "auto" so run keys stay
-                     # portable across machines; the RESOLVED device is
-                     # recorded here, because CPU and GPU do not agree to the
-                     # last digit and a cache hit should say which produced it.
-                     "device": fl["training"]["device"],
-                     "torch": torch.__version__,
-                     "window_size": tr.global_model.window_size,
-                     "n_features": tr.global_model.head.out_features,
-                     "latent_dim": tr.global_model.latent_dim,
-                     "sensors": fl_windows[next(iter(fl_windows))]["sensors"],
-                     "clients": list(tr.clients), "seed": seed,
-                     "rounds": rounds,
-                     "snapshot_rounds": sorted(tr.snap_rounds)},
+                       **{c: tr.local_states[c] for c in tr.clients
+                          if c in tr.local_states}},
+            "meta": _run_meta(fl, tr, fl_windows, spec, seed, rounds,
+                              sorted(tr.snap_rounds)),
             "fl": fl, "fl_windows": fl_windows, "scalers": scalers,
             "trainer": tr, "seconds": seconds}
 
@@ -439,8 +635,9 @@ def _tag(df: pd.DataFrame, world: World) -> pd.DataFrame:
 # sharing, which is the only decoding that is actually well-defined here.
 @torch.no_grad()
 def reconstruction_model(res: dict, world: World, store=None):
-    """The trained model to decode prototypes through (`res["models"]
-    ["global"]` -- equivalently any client's, see above).
+    """The trained GLOBAL model to decode prototypes through
+    (`res["models"]["global"]`). Client entries are local weights (see
+    `local_model`).
 
     Present in `res` after a FRESH `run_cell` (not a cache hit, which does
     not reload weights); on a cache hit, pass `store=` to load them from
@@ -466,6 +663,34 @@ def reconstruction_model(res: dict, world: World, store=None):
 
 
 @torch.no_grad()
+def local_model(res: dict, world: World, client: str, store=None):
+    """`client`'s LOCAL model: its weights after the last local update,
+    before the final FedAvg. Needs a run saved with
+    `meta.client_weights == "local_pre_fedavg"`."""
+    m = res["meta"]
+    if m.get("client_weights") != "local_pre_fedavg":
+        raise ValueError(f"run {res.get('run_key')} has no local weights -- "
+                         f"retrain it with run_cell(..., overwrite=True)")
+    if res.get("models") and client in res["models"]:
+        mdl = bridge.aer_class()(m["n_features"], m["window_size"],
+                                 m["lstm_units"])
+        mdl.load_state_dict(res["models"][client])
+        mdl.eval()
+        return mdl
+    if store is not None:
+        return store.load_model(world.sim_hash, res["run_key"], client=client)
+    raise ValueError("no local weights in `res` and no `store` to load them")
+
+
+def model_device(model) -> "torch.device":
+    """The device a model's parameters live on. Inputs must be built there:
+    during a run the trainer's model is on the GPU, while a model rebuilt
+    from a saved state dict is on the CPU, and mixing the two raises
+    "Input and parameter tensors are not at the same device"."""
+    return next(model.parameters()).device
+
+
+@torch.no_grad()
 def decode(model, z) -> np.ndarray:
     """(B, latent_dim) latent vectors -> (B, window_size, n_features)
     reconstructions -- the decoder half of `AER.forward`, standalone.
@@ -479,7 +704,8 @@ def decode(model, z) -> np.ndarray:
     `fy` (the step predicted AFTER) -- see `aer.AER.forward`.
     """
     model.eval()
-    z = torch.as_tensor(np.asarray(z), dtype=torch.float32)
+    z = torch.as_tensor(np.asarray(z), dtype=torch.float32,
+                        device=model_device(model))
     repeated = z.unsqueeze(1).repeat(1, model.window_size, 1)
     seq, _ = model.decoder(repeated)
     return model.head(seq).cpu().numpy()          # (B, window_size, F)
@@ -511,3 +737,68 @@ def reconstruct_prototypes(model, protos: pd.DataFrame) -> pd.DataFrame:
     out["channel"] = np.tile(np.arange(f), n * w)
     out["value"] = dec.reshape(-1)
     return out
+
+
+# --------------------------------------------------------------------------
+# controls
+# --------------------------------------------------------------------------
+@torch.no_grad()
+def untrained_model(res: dict):
+    """The round -1 model: `FPLTrainer`'s global init, rebuilt.
+
+    `FPLTrainer.__init__` calls `torch.manual_seed(seed)` and builds the AER
+    with no other RNG draw in between (tensor copies draw nothing), so a
+    fresh AER after the same seed is that init exactly -- `aligned.
+    control_check` compares it with the saved round -1 snapshot."""
+    m = res["meta"]
+    torch.manual_seed(int(m["seed"]))
+    mdl = bridge.aer_class()(m["n_features"], m["window_size"], m["lstm_units"])
+    mdl.eval()
+    return mdl
+
+
+def equivalence_check(fl_windows: dict, fl: dict, seed: int = 0,
+                      rounds: int = 2) -> pd.DataFrame:
+    """Does the lab loop reproduce the upstream loop? Trains both for a few
+    rounds on the same windows (CPU) and compares weights and prototypes.
+
+    Three pairs: upstream vs `LossTerms()`; and, when the installed
+    `FPLTrainer` reads `proto_weight`, upstream `proto_weight=0` vs
+    `LossTerms(proto_weight=0)`."""
+    from .specs import LossTerms
+
+    def train(fl_, lt):
+        f = copy.deepcopy(fl_)
+        f["training"]["device"] = "cpu"
+        tr = SnapshotFPLTrainer(fl_windows, f, seed, rounds=rounds,
+                                snapshot_rounds="none", loss_terms=lt)
+        tr.train(rounds)
+        return tr
+
+    def compare(name, a, b):
+        wa, wb = a.global_model.state_dict(), b.global_model.state_dict()
+        dw = max(float((wa[k] - wb[k]).abs().max()) for k in wa)
+        pa = pd.DataFrame(a.local_proto_rows)
+        pb = pd.DataFrame(b.local_proto_rows)
+        fc = [c for c in pa.columns if c.startswith("f") and c[1:].isdigit()]
+        dp = float(np.abs(pa[fc].to_numpy() - pb[fc].to_numpy()).max())
+        return {"pair": name, "max_abs_weight_diff": dw,
+                "max_abs_proto_diff": dp, "identical": dw == 0 and dp == 0}
+
+    base = copy.deepcopy(fl)
+    base["training"].pop("proto_weight", None)
+    rows = [compare("upstream vs LossTerms()",
+                    train(base, None), train(base, LossTerms()))]
+    up0 = copy.deepcopy(base)
+    up0["training"]["proto_weight"] = 0.0
+    try:
+        a = train(up0, None)
+    except RuntimeError as exc:
+        rows.append({"pair": "upstream pw=0 vs LossTerms(proto_weight=0)",
+                     "max_abs_weight_diff": np.nan,
+                     "max_abs_proto_diff": np.nan, "identical": False,
+                     "note": str(exc)})
+    else:
+        rows.append(compare("upstream pw=0 vs LossTerms(proto_weight=0)",
+                            a, train(base, LossTerms(proto_weight=0.0))))
+    return pd.DataFrame(rows)

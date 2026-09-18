@@ -23,6 +23,7 @@ __all__ = ["nodes_module", "preprocess_clients", "deseasonalize",
            "aggregate_prototypes", "extract_prototypes",
            "effective_fl_seed", "compute_drift_signals",
            "deconfounded_prototypes", "FINCH", "fedwater_root",
+           "aer_loss", "split_window_targets", "hierarchical_proto_loss",
            "load_globals", "read_partition", "partition_meta"]
 
 
@@ -159,6 +160,18 @@ def aer_class():
 def FPLTrainer():                        # noqa: N802 - returns the class
     """The `FPLTrainer` CLASS (subclassed by `train.SnapshotFPLTrainer`)."""
     return _training("federated").FPLTrainer
+
+
+def aer_loss(*args, **kw):
+    return _training("aer").aer_loss(*args, **kw)
+
+
+def split_window_targets(*args, **kw):
+    return _training("aer").split_window_targets(*args, **kw)
+
+
+def hierarchical_proto_loss(*args, **kw):
+    return _training("federated").hierarchical_proto_loss(*args, **kw)
 
 
 def aggregate_prototypes(*args, **kw):

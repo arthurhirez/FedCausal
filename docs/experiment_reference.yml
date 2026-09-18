@@ -1,0 +1,144 @@
+# =============================================================================
+# Study reference: every key a study can set (conf/base/experiments.yml).
+# Paste under `studies:` and delete what you do not need; anything omitted
+# falls back to conf/base/parameters.yml, then to the network's profile.yml
+# (network-scoped keys: anchor_scale, consumption map, drift target, ...).
+# =============================================================================
+  reference_study:
+    description: >
+      Annotated template -- every world, run and study key.
+
+    # ------------------------------------------------------------- worlds --
+    # One world = one simulation (+ its probe stacks + sensor placement).
+    # `fixed` applies to all; `grid` is a cartesian product; `zip` is a list of
+    # paired profiles crossed with the grid. Precedence: fixed < grid < zip.
+    worlds:
+      fixed:
+        # --- network and partition ------------------------------------------
+        network: ky7                  # bundle: data/01_raw/<network>/
+                                      # (folder name == profile.yml `name`)
+        districting: manual           # manual | spectral | girvan_newman |
+                                      # fast_greedy | walktrap
+                                      # (default: globals.districting.active)
+        # --- time grid ------------------------------------------------------
+        sim_seed: 42                  # demand draws, partial-coupling closures
+        n_months: 50
+        days_per_month: 30
+        # --- demand ---------------------------------------------------------
+        beta: 0.35                    # land-use level exponent (9.19 ** beta)
+        anchor_scale: 0.5             # default: profile (KY7 0.5, D-Town 0.25,
+                                      # Graeme 0.05)
+        consumption_map: LR_LR_LR_LR  # one token per district, name order;
+                                      # income L/M/H + land use R/M/C/I
+        seasonality_scale: 1.0        # 0.0 = off (world, and probes when
+                                      # placement.probe.seasonality: world)
+        drift_ramp_days: 42
+        # --- dependence dial ------------------------------------------------
+        coupling:
+          variant: baseline           # baseline | partial | isolated
+          close_fraction: 0.0         # partial only
+        # --- the drift the world carries ------------------------------------
+        drift:
+          tgt_district: District_A    # generated partitions: A = largest
+          # seed_node: J-507          # omit -> profile seed (manual only),
+                                      # else largest-base-demand junction
+          warmup_months: 12           # >= 12 when probes carry seasonality
+          growth_chance: 0.8
+          max_neighbors_per_month: 2
+          to_income: low              # low | medium | high
+          to_land_use: industrial     # residential | mixed | commercial |
+                                      # industrial (must change the district)
+        # --- sensor placement (deep-merged into sensor_placement) ------------
+        placement:
+          source: dynamic             # dynamic | manual (profile `sensors:`)
+          slots:                      # identical for every district
+            flow:     {pure: 3, mixed: 2}
+            pressure: {pure: 3, mixed: 2}
+          classes:
+            core_purity: 0.85         # pure slot: home share >= this
+            foreign_max: 0.15
+            mixed_min_foreign: 0.25   # mixed slot: largest foreign share
+            min_n_mass: 2
+            max_purity_swing: 0.20    # 1.0 disables the stability gate
+            null_factor: 1.5
+            null_factors: [1.0, 1.5, 3.0]
+          dedupe_min_distance: 0.10
+          selection_coupling: {variant: baseline}   # baseline | isolated
+          probe:
+            horizon: world            # world | planned
+            seasonality: world        # world | none
+            diffusion: planned        # planned | world
+            growth_chance: 1.0        # diffusion: planned
+            transitions:              # initial land use -> probe land use
+              residential: industrial
+              mixed: industrial
+              commercial: industrial
+              industrial: residential
+            seed: 42
+            # planned grid only (horizon: planned)
+            days_per_month: 14
+            warmup_months: 8
+            drift_ramp_days: 7
+            n_months: auto
+            convert_months: 12
+            max_neighbors_per_month: auto
+            settled_months: 8         # when seasonality is none
+            settle: {ref_months: 3, slack: 0.01, pad: 1, min_months: 3}
+            battery_max_lag_h: 6.0
+            top_carriers: 5
+            retain_series: true       # false saves ~0.1 GB per probe world;
+                                      # the browsers then have no series
+        # --- dependence oracle (deep-merged into oracle) ---------------------
+        oracle:
+          tiers: [1, 2, 3, 4]
+          max_lag_h: 6
+          n_surrogates: 100
+          n_surrogates_expensive: 50
+          subsample: 1500
+          dcor_subsample: 1000
+          granger_lags: 24
+          ccm: {embed_dim: 3, tau: 2, lib_sizes: [200, 1200], n_neighbors: 4}
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 2500, pca_dims: 10}
+        # --- anything else: whole blocks, deep-merged (not `fl`, `districting`)
+        sim_overrides:
+          noise: {}                   # e.g. measurement noise
+          validation: {}              # V-check thresholds
+          land_use: {}
+          buildings: {}
+          patterns: {}                # e.g. seasonal_peak_month
+      grid:
+        districting: [spectral, girvan_newman, fast_greedy]
+        # consumption_map: [LR_LR_LR_LR, LR_MC_HI_LM]
+        # beta: [0.0, 0.35, 0.5]
+        # anchor_scale: [0.3, 0.5]
+        # coupling: [{variant: baseline}, {variant: partial, close_fraction: 0.5}]
+      # zip:
+      #   - {drift: {tgt_district: District_A}}
+      #   - {drift: {tgt_district: District_B}}
+
+    # --------------------------------------------------------------- runs --
+    # One run = one FL training + analysis on a cached world.
+    runs:
+      fixed:
+        fl_seed: 0
+        rounds: 8
+        batch_size: 128
+        learning_rate: 0.001
+        local_epochs: 1
+        participation: 1.0
+        lstm_units: 32
+        step_size: 6
+        n_surrogates: 100
+        n_surrogates_expensive: 50
+        fl_overrides:                 # any fl.* key, deep-merged
+          preprocessing:
+            channels: [flow, pressure]   # which slots become features
+            classes: all                 # all | [pure] | [mixed]
+      # grid:
+      #   fl_seed: [0, 1, 2, 3, 4]
+
+    # -------------------------------------------------------------- study --
+    pipelines: [fl, dependence_detection, drift_attribution]   # [] = worlds only
+    harvest: [validation, drift, ladder, dependence, pairs, clients]
+    retain: []                        # heavy artifacts to copy, e.g.
+                                      # [prototype_history]
