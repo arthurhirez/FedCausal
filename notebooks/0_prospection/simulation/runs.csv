@@ -1,0 +1,2 @@
+world_hash,run_key,label,tag,placement,kinds,transform,scaling,interval_agg_h,window_size,step_size,reference_months,lstm_units,rounds,fl_seed,sensor_hash,n_windows,seconds,saved_at,status
+out,37178f58c9ab,manual-fp__none__minmax_ref__a1w24s4__u16r5s0,out,manual,flow+pressure,none,minmax_ref,1,24,4,14,16,5,0,a746cda0,35390,38.6,2026-09-10 14:50:17,ok

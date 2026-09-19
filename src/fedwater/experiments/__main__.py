@@ -2,7 +2,9 @@
 
 Commands
 --------
-list                       Show studies declared in conf/base/experiments.yml.
+list                       Show studies declared in conf/base/experiments.yml
+                           (only those whose partitions are already built
+                           expand; the rest are listed as `needs partitions`).
 run <study>                Execute a study (cache-or-run at every level).
     --n-jobs N             Parallel runs (subprocess-bound; BLAS threads are
                            capped per worker automatically).
@@ -57,12 +59,18 @@ def main(argv: list[str] | None = None) -> int:
         cfg = load_studies(project)
         rows = []
         for name, study in cfg.get("studies", {}).items():
-            d = expand_study(name, project)
+            desc = (study.get("description", "").strip().split("\n")[0][:70])
+            try:
+                d = expand_study(name, project)
+            except FileNotFoundError as exc:
+                rows.append({"study": name, "worlds": None,
+                             "runs_per_world": None, "total_runs": None,
+                             "description": f"needs partitions ({exc})"[:70]})
+                continue
             rows.append({"study": name, "worlds": len(d["worlds"]),
                          "runs_per_world": len(d["runs"]),
                          "total_runs": len(d["worlds"]) * len(d["runs"]),
-                         "description": (study.get("description", "")
-                                         .strip().split("\n")[0][:70])})
+                         "description": desc})
         _print(pd.DataFrame(rows))
         return 0
 
@@ -80,8 +88,8 @@ def main(argv: list[str] | None = None) -> int:
                   f"{args.study}/runs.parquet")
         return 0
 
-    study_def = expand_study(args.study, project)
-    engine = ExperimentEngine(project, root=study_def["root"])
+    engine = ExperimentEngine(
+        project, root=load_studies(project).get("root", "data/09_experiments"))
     if args.command == "collect":
         index = engine.collect(args.study)
         print(f"collected {len(index)} runs.")

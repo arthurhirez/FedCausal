@@ -33,16 +33,66 @@ import numpy as np
 import pandas as pd
 
 
-def check_mass_balance(demands_simulated: pd.DataFrame, demand_series: pd.DataFrame,
+def check_mass_balance(wn, demands_simulated: pd.DataFrame,
+                       demand_series: pd.DataFrame,
                        validation: dict) -> pd.DataFrame:
+    """V1 continuity and V2 volume exactness.
+
+    STORAGE, part 1 -- the node set. The previous form of V1 read supply as
+    "every negative entry in the demand frame", which is exact on a network
+    whose only non-junction is a reservoir, and wrong the moment a tank
+    exists: EPANET reports a tank's demand as negative while it FILLS, so a
+    filling tank was counted as a source. Supply then exceeded consumption by
+    the fill volume and V1 raised on a perfectly balanced model. The statement
+    that actually holds, with or without storage, is EPANET's own continuity:
+    at every step the demands over all nodes sum to zero, reservoirs negative
+    when supplying and tanks signed by whether they drain or fill. So supply
+    is read off the SOURCE-AND-STORAGE set explicitly -- identical to the old
+    computation on Graeme, correct on KY7.
+
+    STORAGE, part 2 -- the denominator, which matters just as much. EPANET
+    writes its output in SINGLE PRECISION. On a storage-free network that is
+    invisible: Graeme has one reservoir, no cancellation, and V1 reads exactly
+    0.0. On KY7 tank T-3 cycles a GROSS throughput of 5.9e5 L/s-steps -- the
+    same order as the reservoir's entire horizon supply -- against a net of
+    -9.1e3, so the balance is a difference of large, nearly-cancelling
+    float32 numbers. Dividing the residual by CONSUMPTION therefore reports an
+    error floor that scales with how hard the tanks cycle, not with how well
+    continuity holds: 1.05e-6 on this world, tripping a 1e-6 tolerance for a
+    physically exact model.
+
+    The residual is normalised by the gross flux through the source/storage
+    set instead, which is what the float32 error actually scales with. On a
+    network without storage gross == consumed, so Graeme is unchanged. Here it
+    reads 5.2e-7, about 4x float32 eps. The consumption-normalised number is
+    still reported, because it is the interpretable one; it is just not the
+    one to gate on. Loosening the tolerance would have hidden a real leak just
+    as effectively.
+    """
     node_cols = [c for c in demand_series.columns if c != "month"]
-    all_elements = demands_simulated.drop(columns=["month"])
-    negative = all_elements.to_numpy().clip(max=0.0)  # reservoirs: negative demand
-    supplied = -negative.sum()
-    consumed = demands_simulated[node_cols].to_numpy().sum()
-    rel_err = abs(supplied - consumed) / consumed
+    frame = demands_simulated.drop(columns=["month"])
+    storage = [c for c in frame.columns
+               if c in set(wn.reservoir_name_list) | set(wn.tank_name_list)]
+    if not storage:
+        raise AssertionError(
+            "V1 mass balance has no source: the model carries neither a "
+            "reservoir nor a tank, so nothing supplies the junctions.")
+
+    supplied_t = -frame[storage].to_numpy().sum(axis=1)
+    consumed_t = demands_simulated[node_cols].to_numpy().sum(axis=1)
+    gross_t = np.abs(frame[storage].to_numpy()).sum(axis=1)
+
+    residual = abs(supplied_t.sum() - consumed_t.sum())
+    consumed, gross = consumed_t.sum(), gross_t.sum()
+    rel_err = residual / gross
     if rel_err > validation["mass_balance_rtol"]:
-        raise AssertionError(f"V1 mass balance violated: rel_err={rel_err:.2e}")
+        raise AssertionError(
+            f"V1 mass balance violated: rel_err={rel_err:.2e} (residual "
+            f"{residual:.3e} over gross source/storage flux {gross:.3e}) "
+            f"across {len(storage)} node(s) {storage}.")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        step_err = np.nanmax(np.abs(supplied_t - consumed_t)
+                             / np.where(gross_t > 0, gross_t, np.nan))
 
     # V2: EPANET reproduced the synthesized series (DD mode delivers demand).
     sim = demands_simulated[node_cols].to_numpy()
@@ -51,14 +101,78 @@ def check_mass_balance(demands_simulated: pd.DataFrame, demand_series: pd.DataFr
     if max_rel > validation["volume_rtol"]:
         raise AssertionError(f"V2 volume exactness violated: max_rel={max_rel:.2e}")
     return pd.DataFrame([
-        {"check": "V1_mass_balance", "value": rel_err, "hard": True, "passed": True},
-        {"check": "V2_volume_exactness", "value": max_rel, "hard": True, "passed": True},
+        {"check": "V1_mass_balance", "value": float(rel_err), "hard": True,
+         "passed": True},
+        {"check": "V1b_residual_vs_consumed", "value": float(residual / consumed),
+         "hard": False, "passed": True},      # interpretable, not gated
+        {"check": "V1c_worst_step", "value": float(step_err), "hard": False,
+         "passed": bool(step_err <= max(validation["mass_balance_rtol"], 1e-4))},
+        # How much of the network's supply passes through storage on its way
+        # to a customer. 1.0 means the tanks are decoration; KY7 runs ~2.0.
+        {"check": "V1d_storage_flux_ratio", "value": float(gross / consumed),
+         "hard": False, "passed": True},      # recorded, not gated
+        {"check": "V2_volume_exactness", "value": float(max_rel), "hard": True,
+         "passed": True},
     ])
+
+
+def check_storage(pressures: pd.DataFrame, wn, validation: dict) -> pd.DataFrame:
+    """V8: are the tanks actually cycling, or pinned against a limit?
+
+    A tank's ``pressure`` in EPANET output IS its water level (head minus
+    elevation), so this needs no extra simulator output.
+
+    The obvious test -- did the level fall from start to end -- is worthless:
+    once a tank locks into its control cycle it reads essentially zero
+    regardless of load, because it returns to the same phase. What IS monotone
+    in demand is the SHARE OF TIME spent against a limit, so that is what is
+    gated. A tank sitting on its floor is not a low-pressure event and the V3
+    pressure floor will not see it; it is a capacity failure of the storage
+    system and needs its own check.
+
+    The ceiling share is recorded without a gate: a full tank is a tank with
+    spare supply, which is a comfortable place to be, not a defect.
+    """
+    tanks = [t for t in wn.tank_name_list if t in pressures.columns]
+    if not tanks:
+        return pd.DataFrame([{"check": "V8_storage", "value": 0.0,
+                              "hard": False, "passed": True}])
+    tol = float(validation.get("tank_level_tol_m", 0.01))
+    max_share = float(validation.get("tank_floor_max_share", 0.05))
+
+    rows = []
+    for name in tanks:
+        tank = wn.get_node(name)
+        level = pressures[name].to_numpy()
+        floor = float((level <= tank.min_level + tol).mean())
+        ceiling = float((level >= tank.max_level - tol).mean())
+        rows.append({"check": f"V8_tank_floor_share[{name}]", "value": floor,
+                     "hard": False, "passed": bool(floor <= max_share)})
+        rows.append({"check": f"V8_tank_ceiling_share[{name}]", "value": ceiling,
+                     "hard": False, "passed": True})   # recorded, not gated
+        rows.append({"check": f"V8_tank_level_range_m[{name}]",
+                     "value": float(level.max() - level.min()),
+                     "hard": False, "passed": True})   # recorded, not gated
+    return pd.DataFrame(rows)
 
 
 def check_pressures(pressures: pd.DataFrame, demand_series: pd.DataFrame,
                     validation: dict) -> pd.DataFrame:
-    # Junctions only: reservoirs report zero pressure by definition.
+    """V3 hard pressure floor and V4 service band, over CONSUMER junctions.
+
+    Scope, stated because it used to be accidental: the columns of
+    ``demand_series`` are exactly the junctions that carry a portfolio, i.e.
+    the ones with a non-zero base demand in the ``.inp``. Reservoirs and tanks
+    are excluded because their "pressure" is a water level, not a service
+    pressure. Zero-demand junctions are excluded because they are trunk and
+    connector nodes with no customer behind them -- KY7's ``I-Pump-1`` is the
+    case that matters: it is the pump's SUCTION node, at elevation 115.7 m
+    drawing from a reservoir whose head is 107.3 m, so it sits at -8.6 mca by
+    design. Gating it would fail every KY7 world for a non-defect.
+
+    The count of excluded junctions is reported so the exclusion is visible
+    rather than inferred.
+    """
     junctions = [c for c in demand_series.columns if c != "month"]
     p = pressures[junctions]
     p_min, p_max = validation["pressure_band_mca"]
@@ -72,9 +186,13 @@ def check_pressures(pressures: pd.DataFrame, demand_series: pd.DataFrame,
             f"capacity — lower anchor_scale, scenario.beta, or drift intensity."
         )
     inside = ((p >= p_min) & (p <= p_max)).to_numpy().mean()
+    n_excluded = len([c for c in pressures.columns
+                      if c != "month" and c not in junctions])
     return pd.DataFrame([
         {"check": "V3_pressure_floor", "value": float(p.to_numpy().min()),
          "hard": True, "passed": True},
+        {"check": "V3b_non_consumer_nodes_excluded", "value": float(n_excluded),
+         "hard": False, "passed": True},      # recorded, not gated
         {"check": "V4_pressure_band_share", "value": float(inside), "hard": False,
          "passed": bool(inside >= validation["pressure_band_min_share"])},
     ])

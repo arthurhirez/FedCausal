@@ -23,10 +23,11 @@ correlation (all clients share the weather).
 """
 from __future__ import annotations
 
-import zlib
-
 import numpy as np
 import pandas as pd
+
+from fedwater.hashing import stable_hash
+from fedwater.networks.partition import district_nodes
 
 from . import methods as M
 
@@ -63,9 +64,21 @@ def district_signals(sensor_series: pd.DataFrame, steps_day: int,
 # --------------------------------------------------------------------------
 # topology (unchanged behaviour)
 # --------------------------------------------------------------------------
+def _pressure_elements(sensor_placement: pd.DataFrame) -> dict:
+    """``{district: [junction, ...]}`` for the world's pressure gauges."""
+    p = sensor_placement[sensor_placement["kind"] == "pressure"]
+    return {d: [str(e) for e in g["element"]]
+            for d, g in p.groupby("district", sort=False)}
+
+
 def topology_features(wn, districts: dict, gt_boundaries: pd.DataFrame,
-                      sensors: dict) -> pd.DataFrame:
+                      sensor_placement: pd.DataFrame) -> pd.DataFrame:
+    """Structural truth per district pair. ``hydraulic_distance_m`` is the
+    mean shortest open-pipe path between the two districts' PRESSURE gauges,
+    read from the world's placement (per world, not per network)."""
     import networkx as nx
+
+    pressure = _pressure_elements(sensor_placement)
 
     closed = set(gt_boundaries.loc[gt_boundaries["closed"], "pipe"])
     G = nx.Graph()
@@ -75,15 +88,15 @@ def topology_features(wn, districts: dict, gt_boundaries: pd.DataFrame,
             G.add_edge(pipe.start_node_name, pipe.end_node_name,
                        weight=pipe.length)
 
-    names = list(districts["districts"].keys())
+    names = list(district_nodes(districts))
     rows = []
     for i, da in enumerate(names):
         for db in names[i + 1:]:
             pair = gt_boundaries[(gt_boundaries["district_a"] == min(da, db)) &
                                  (gt_boundaries["district_b"] == max(da, db))]
             dists = []
-            for na in sensors[da]["pressure"]:
-                for nb in sensors[db]["pressure"]:
+            for na in pressure.get(da, []):
+                for nb in pressure.get(db, []):
                     try:
                         dists.append(nx.shortest_path_length(
                             G, str(na), str(nb), weight="weight"))
@@ -202,7 +215,7 @@ def dependence_battery(sensor_series: pd.DataFrame,
             for db in keys[i + 1:]:
                 a, b = sig[da], sig[db]
                 rng = np.random.default_rng(
-                    [seed, zlib.crc32(f"{da}|{db}|{kind}".encode())])
+                    [seed, stable_hash((da, db, kind))])
                 base = dict(kind=kind, district_a=da, district_b=db)
 
                 if 1 in tiers:
@@ -268,7 +281,7 @@ def dependence_battery(sensor_series: pd.DataFrame,
                         continue
                     X, Y = mats[da], mats[db]
                     rng = np.random.default_rng(
-                        [seed, 4, zlib.crc32(f"{da}|{db}|{kind}".encode())])
+                        [seed, 4, stable_hash((da, db, kind))])
                     base = dict(kind=kind, district_a=da, district_b=db)
 
                     s, p = _roll_matrix_pvalue(M.rv_coefficient, X, Y,

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from fedwater.pipelines.drift_attribution.nodes import (
     apply_correctors,
@@ -165,7 +166,7 @@ def test_c4_loop_beats_median_under_heterogeneous_gains():
 def test_world_specs_deterministic_and_valid():
     import yaml
     from fedwater.pipelines.label_factory.nodes import build_world_specs
-    districts = yaml.safe_load(open("data/01_raw/districts_graeme.yml"))
+    districts = yaml.safe_load(open("data/01_raw/graeme/districts.yml"))
     fl = {"label_factory": {
         "n_worlds": 6, "drift_incomes": ["low"],
         "drift_land_uses": ["mixed", "commercial", "industrial"],
@@ -181,7 +182,9 @@ def test_world_specs_deterministic_and_valid():
 
 
 def test_automl_grouped_cv_learns_planted_rule():
-    from fedwater.pipelines.automl.nodes import train_learned_detectors
+    # fedwater.pipelines.automl was not part of the refactor's source drop
+    automl = pytest.importorskip("fedwater.pipelines.automl.nodes")
+    train_learned_detectors = automl.train_learned_detectors
     rng = np.random.default_rng(4)
     n = 400
     worlds = np.repeat(np.arange(8), n // 8)

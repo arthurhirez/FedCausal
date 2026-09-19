@@ -72,6 +72,51 @@ def _windows_and_labels(agg: np.ndarray, agg_months: np.ndarray,
             labels[mask], starts[mask])
 
 
+_CHANNEL_PREFIX = {"pressure": "p_", "flow": "q_"}
+_SLOT_CLASSES = ("pure", "mixed")
+
+
+def select_feature_columns(columns, cfg: dict, client: str = "") -> list[str]:
+    """Which sensor columns become model features, in a fixed order.
+
+    ``fl.preprocessing.channels`` (pressure / flow) and ``.classes``
+    (``all`` or a subset of pure / mixed) are RUN-level choices: a world
+    always packages every slot, so switching what the model sees is a cheap
+    run on a cached world, never a re-simulation.
+
+    Class filtering needs slot-named columns (``q_pure_0``). A manual
+    placement keeps element names (``q_P-13``) and carries no class, so it
+    accepts only ``classes: all``.
+    """
+    channels = list(cfg.get("channels") or _CHANNEL_PREFIX)
+    unknown = set(channels) - set(_CHANNEL_PREFIX)
+    if unknown:
+        raise ValueError(f"fl.preprocessing.channels: unknown {sorted(unknown)}"
+                         f" (allowed {sorted(_CHANNEL_PREFIX)})")
+    prefixes = tuple(_CHANNEL_PREFIX[c] for c in channels)
+    cols = sorted(c for c in columns if c.startswith(prefixes))
+
+    classes = cfg.get("classes", "all")
+    if classes not in (None, "all"):
+        classes = [classes] if isinstance(classes, str) else list(classes)
+        bad = set(classes) - set(_SLOT_CLASSES)
+        if bad:
+            raise ValueError(f"fl.preprocessing.classes: unknown {sorted(bad)}"
+                             f" (allowed 'all' or {list(_SLOT_CLASSES)})")
+        unslotted = [c for c in cols
+                     if c[2:].split("_", 1)[0] not in _SLOT_CLASSES]
+        if unslotted:
+            raise ValueError(
+                f"{client}: fl.preprocessing.classes={classes} needs "
+                f"slot-named columns, got {unslotted[:3]} (a manual "
+                "placement has no classes; use classes: all)")
+        cols = [c for c in cols if c[2:].split("_", 1)[0] in classes]
+    if not cols:
+        raise ValueError(f"{client}: no sensor column survives "
+                         f"channels={channels} classes={classes}")
+    return cols
+
+
 def preprocess_clients(client_datasets: dict, fl: dict, time: dict):
     """PartitionedDataset of client CSVs -> windows/labels/scalers/report.
 
@@ -94,7 +139,7 @@ def preprocess_clients(client_datasets: dict, fl: dict, time: dict):
     for client in sorted(client_datasets):
         df = client_datasets[client]() if callable(client_datasets[client]) \
             else client_datasets[client]
-        sensors = sorted(c for c in df.columns if c.startswith(("p_", "q_")))
+        sensors = select_feature_columns(df.columns, cfg, client)
         values = df[sensors].to_numpy(dtype=np.float64)
         months = df["month"].to_numpy()
 
