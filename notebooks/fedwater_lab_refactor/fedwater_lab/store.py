@@ -309,7 +309,9 @@ class Store:
                 except Exception as exc:          # unreadable run
                     row.update(label=None, mismatch=f"unreadable: {exc}", ok=False)
                 rows.append(row)
-        return pd.DataFrame(rows)
+        cols = ["world_hash", "run_key", "label", "rounds_spec", "rounds_fl",
+                "epochs_spec", "epochs_fl", "mismatch", "ok"]
+        return pd.DataFrame(rows, columns=None if rows else cols)
 
     def purge(self, world_hash: str, run_keys) -> list[str]:
         """Delete these runs (directory + index row). Returns what was removed.

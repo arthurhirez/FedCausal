@@ -36,10 +36,12 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from .recon import _r as RC_r
 from .worlds import World
 
 __all__ = ["drift_profile", "visibility", "compare_visibility",
-           "plot_profiles", "plot_prequential", "SIGNALS"]
+           "plot_profiles", "plot_prequential", "prototype_similarity",
+           "similarity_fidelity", "plot_similarity", "SIGNALS"]
 
 SIGNALS = ("r", "rmse", "e_lat", "cos_lat")
 _LOWER_IS_MOVED = ("r", "amp")            # these fall when the fit breaks
@@ -167,4 +169,120 @@ def plot_prequential(ax, preq: pd.DataFrame, world: World, metric: str = "r",
     ax.set(xlabel="block (month range midpoint)",
            ylabel=f"{metric} on the UNSEEN block ({model} model)")
     ax.legend(fontsize=7, ncol=2)
+    return ax
+
+
+# --------------------------------------------------------------------------
+# are the prototypes good enough for the NEXT step?
+# --------------------------------------------------------------------------
+def prototype_similarity(run, channels: pd.DataFrame | None = None,
+                         slot_class: str | None = "pure") -> pd.DataFrame:
+    """Client-to-client similarity per calendar class, in three spaces.
+
+    For an `aligned.AlignedRun` built with a calendar key (`ALIGN168`), and
+    for each group g = (block, cycle_pos) and each ordered pair c < d:
+
+    s_true = mean over the selected channels i of corr_t(T[c,g,i], T[d,g,i])
+             -- the data's own answer, the ceiling;
+    s_dec  = the same on the DECODED prototypes dec(p[c,g]);
+    s_lat  = cos(p[c,g], p[d,g]) -- the raw latent prototype, the artifact a
+             federated dependence step would actually exchange.
+
+    Channels are compared index by index, which is what makes sense here
+    because `data.client_frames` orders them by slot in every client;
+    `slot_class` restricts to pure or mixed slots.
+
+    The point of the three columns is that `s_true` is computable ONLY with
+    the raw data, so it is the yardstick the other two are scored against
+    (`similarity_fidelity`)."""
+    g = run.groups.set_index("gid")
+    true, dec = run.arrays["true"], run.arrays.get("aligned", {})
+    fc = [c for c in run.protos.columns if c.startswith("f") and c[1:].isdigit()]
+    lat = {(r.client, int(r.gid)): np.array([getattr(r, f) for f in fc], float)
+           for r in run.protos.itertuples(index=False)}
+    keep = None
+    if channels is not None and slot_class is not None:
+        keep = {c: set(sub.loc[sub["slot_class"] == slot_class, "channel"]
+                       .astype(int))
+                for c, sub in channels.groupby("client")}
+
+    by_gid: dict = {}
+    for (c, gid) in true:
+        by_gid.setdefault(int(gid), []).append(c)
+    rows = []
+    for gid, cs in by_gid.items():
+        cs = sorted(cs)
+        info = g.loc[gid]
+        for i, c in enumerate(cs):
+            for d in cs[i + 1:]:
+                Tc, Td = true[(c, gid)], true[(d, gid)]
+                idx = range(Tc.shape[1]) if keep is None else sorted(
+                    keep.get(c, set()) & keep.get(d, set()))
+                if not len(list(idx)):
+                    continue
+                idx = list(idx)
+                st = float(np.mean([RC_r(Tc[:, k], Td[:, k]) for k in idx]))
+                row = {"gid": gid, "phase": info["phase"], "cycle": info["cycle"],
+                       "block_label": info["block_label"], "pair": f"{c[-1]}{d[-1]}",
+                       "client_a": c, "client_b": d, "s_true": st}
+                if (c, gid) in dec and (d, gid) in dec:
+                    Dc, Dd = dec[(c, gid)], dec[(d, gid)]
+                    row["s_dec"] = float(np.mean([RC_r(Dc[:, k], Dd[:, k])
+                                                  for k in idx]))
+                if (c, gid) in lat and (d, gid) in lat:
+                    a, b = lat[(c, gid)], lat[(d, gid)]
+                    row["s_lat"] = float(a @ b / max(np.linalg.norm(a)
+                                                     * np.linalg.norm(b), 1e-12))
+                rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def similarity_fidelity(sim: pd.DataFrame, by=("phase",)) -> pd.DataFrame:
+    """How well each space reproduces the data's similarity structure.
+
+    Per group of `by`, for space in {dec, lat}: Pearson and Spearman of
+    (s_space, s_true) over the client pairs, the mean signed error, and the
+    share of PAIR ORDERINGS preserved (the fraction of pair couples ranked
+    the same way in both) -- ordering is what a dependence step consumes."""
+    out = []
+    for key, d in sim.groupby(list(by)):
+        base = d["s_true"].to_numpy(float)
+        for space in ("s_dec", "s_lat"):
+            if space not in d or d[space].isna().all():
+                continue
+            v = d[space].to_numpy(float)
+            ok = np.isfinite(v) & np.isfinite(base)
+            if ok.sum() < 3:
+                continue
+            a, b = base[ok], v[ok]
+            pear = float(np.corrcoef(a, b)[0, 1])
+            ra = pd.Series(a).rank().to_numpy()
+            rb = pd.Series(b).rank().to_numpy()
+            spear = float(np.corrcoef(ra, rb)[0, 1])
+            conc = np.mean([(a[i] - a[j]) * (b[i] - b[j]) > 0
+                            for i in range(len(a)) for j in range(i + 1, len(a))
+                            if a[i] != a[j]])
+            row = dict(zip(by, key if isinstance(key, tuple) else (key,)))
+            row.update(space=space[2:], n_pairs=int(ok.sum()), pearson=pear,
+                       spearman=spear, concordant=float(conc),
+                       mean_err=float(np.mean(b - a)))
+            out.append(row)
+    return pd.DataFrame(out)
+
+
+def plot_similarity(ax, sim: pd.DataFrame, space: str = "s_dec",
+                    phase: str | None = None):
+    """s_space against s_true, one point per (pair, class); the diagonal is
+    perfect recovery of the data's similarity."""
+    from .figures import colour_map
+    d = sim if phase is None else sim[sim["phase"] == phase]
+    cm = colour_map(sorted(d["pair"].unique()))
+    for p, g in d.groupby("pair"):
+        ax.scatter(g["s_true"], g[space], s=12, alpha=0.7, color=cm[p], label=p)
+    lo = float(min(d["s_true"].min(), d[space].min()))
+    ax.plot([lo, 1], [lo, 1], "k--", lw=0.8)
+    ax.set(xlabel="similarity from the true class means",
+           ylabel=f"similarity from {space[2:]} prototypes")
+    ax.set_title(phase or "all phases", fontsize=9, loc="left")
+    ax.legend(fontsize=7, ncol=3)
     return ax
