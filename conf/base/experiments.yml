@@ -185,6 +185,42 @@ studies:
     harvest: [validation]
 
 
+  ky7_probe_worlds:
+    description: >
+      KY7, manual partition, map LI_LR_LI_LI: FL on the four promoted probe
+      worlds (each district drifting in turn), probes on the world grid.
+    worlds:
+      fixed:
+        network: ky7
+        districting: manual
+        sim_seed: 42
+        n_months: 50                 # the pre-flight needs >= 46 here
+        days_per_month: 30
+        seasonality_scale: 1.0
+        drift_ramp_days: 42
+        beta: 0.35
+        consumption_map: LI_LR_LI_LI
+        coupling: {variant: baseline, close_fraction: 0.0}
+        drift: {tgt_district: District_A, warmup_months: 12,
+                to_income: low, to_land_use: residential}
+        placement:
+          source: dynamic
+          probe: {horizon: world, seasonality: world, diffusion: planned,
+                  seed: world, retain_series: true}
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+      # grid:
+      #   sim_seed: [42, 43, 44]     # replicates: one stack + K probe worlds each
+    runs:
+      fixed: {rounds: 8}
+      grid:
+        fl_seed: [0, 1, 2]
+    promote_probes: probes_only
+
+
 
   ky72_districting_probe_V2:
     description: >
