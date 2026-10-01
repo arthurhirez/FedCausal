@@ -241,12 +241,82 @@ def build_portfolios(wn, districts: dict, landuse_factors: pd.DataFrame,
 # --------------------------------------------------------------------------
 # drift
 # --------------------------------------------------------------------------
+def drift_front(drift: dict, n_target: int) -> int:
+    """The drift front WIDTH, in nodes per month, for one target district.
+
+    ``max_neighbors_per_month`` is either an int (a fixed width, the same for
+    every district) or ``auto``: ``ceil(n_target / convert_months)``, where
+    ``n_target`` is the number of junctions of the drifting district -- the
+    subgraph :func:`build_drift_schedule` diffuses on. ``auto`` sizes the
+    front so a district of any size converts in about ``convert_months``; it
+    cannot beat the seed's eccentricity (the front advances at most one hop
+    per month), so the finish month still comes from the schedule itself.
+
+    One function for every caller (the world's schedule, the probes' plan,
+    the engine's horizon), so the three cannot resolve ``auto`` differently.
+    """
+    width = drift.get("max_neighbors_per_month")
+    if width == "auto":
+        convert = drift.get("convert_months")
+        if convert in (None, "auto") or int(convert) < 1:
+            raise ValueError(
+                "drift.max_neighbors_per_month is 'auto' but "
+                f"drift.convert_months is {convert!r}: set the target "
+                "conversion time (months, >= 1) next to it.")
+        return max(1, -(-int(n_target) // int(convert)))
+    if width is None or int(width) < 1:
+        raise ValueError("drift.max_neighbors_per_month must be an int >= 1 "
+                         f"or 'auto', got {width!r}.")
+    return int(width)
+
+
+def drift_completion(wn, districts: dict, network_profile: dict,
+                     scenario: dict, seed: int,
+                     cap_months: int = 10_000) -> dict:
+    """The EXACT month the world's last node switches, before simulating it.
+
+    Replays :func:`build_drift_schedule` itself with the horizon lifted to
+    ``cap_months``. The schedule is a deterministic function of the district
+    subgraph, the seed node, the drift block and the seed, and the horizon
+    only truncates it: the diffusion stops on its own when the front runs out
+    of candidates, and every month before that consumes the RNG identically
+    whatever ``n_months`` is. So a world whose horizon covers
+    ``last_switch`` reproduces this schedule exactly.
+
+    Returns ``{"last_switch", "first_switch", "n_converted", "n_reachable",
+    "n_nodes", "front"}``. ``n_reachable`` is the seed's component inside the
+    district; a district that is not contiguous from its seed completes when
+    that component has converted, which is all the diffusion can reach.
+    """
+    import networkx as nx
+
+    drift = scenario["drift"]
+    probe = {**scenario, "n_months": int(cap_months)}
+    sch = build_drift_schedule(wn, districts, network_profile, probe, seed)
+    district = drift["tgt_district"]
+    nodes = set(district_nodes(districts)[district])
+    G = wn.to_graph().to_undirected().subgraph(nodes)
+    origin = str(sch.sort_values("drift_month")["node"].iloc[0])
+    reach = len(nx.node_connected_component(G, origin))
+    if len(sch) < reach:
+        raise ValueError(
+            f"drift on {district} converted {len(sch)} of {reach} reachable "
+            f"junctions within {cap_months} months (growth_chance "
+            f"{drift['growth_chance']}); the diffusion does not complete.")
+    return {"last_switch": int(sch["drift_month"].max()),
+            "first_switch": int(sch["drift_month"].min()),
+            "n_converted": int(len(sch)), "n_reachable": int(reach),
+            "n_nodes": int(len(nodes)),
+            "front": drift_front(drift, len(nodes))}
+
+
 def build_drift_schedule(wn, districts: dict, network_profile: dict,
                          scenario: dict, seed: int) -> pd.DataFrame:
     """Drift as diffusion on the target district's subgraph — ground truth.
 
     From ``seed_node``, each post-warmup month converts (with probability
-    ``growth_chance``) up to ``max_neighbors_per_month`` untouched neighbours.
+    ``growth_chance``) up to ``max_neighbors_per_month`` untouched neighbours
+    (an int, or ``auto`` -- see :func:`drift_front`).
     Note that ``max_neighbors_per_month`` limits the WIDTH of the front, not
     its depth: the front advances one BFS ring per month, so a short horizon
     leaves the district only partially converted.
@@ -270,6 +340,7 @@ def build_drift_schedule(wn, districts: dict, network_profile: dict,
     rng = np.random.default_rng(seed)
     district = drift["tgt_district"]
     nodes = set(district_nodes(districts)[district])
+    front = drift_front(drift, len(nodes))
 
     G = wn.to_graph().to_undirected().subgraph(nodes)
     # Seed precedence lives in networks.profile.resolve_seed_node and is
@@ -302,7 +373,7 @@ def build_drift_schedule(wn, districts: dict, network_profile: dict,
             break
         take = rng.choice(
             candidates,
-            size=min(drift["max_neighbors_per_month"], len(candidates)),
+            size=min(front, len(candidates)),
             replace=False,
         )
         for n in take:

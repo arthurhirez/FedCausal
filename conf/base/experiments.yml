@@ -185,40 +185,44 @@ studies:
     harvest: [validation]
 
 
-  ky7_probe_worlds:
+  ky7_all_districts:
     description: >
-      KY7, manual partition, map LI_LR_LI_LI: FL on the four promoted probe
-      worlds (each district drifting in turn), probes on the world grid.
+      KY7, manual partition, map LI_LR_LI_LI: every district drifts in turn,
+      each to the target its probe world converts it to (probe.transitions,
+      income kept), as INDEPENDENT worlds -- sim_seed 43 against probe seed
+      42, so the sensors were not chosen on these worlds. The front is sized
+      per district (auto, ~12 months to convert) and the horizon is automatic:
+      12 drift-free months, conversion, ramp, pad, 12 settled + 3 spare -- one
+      n_months for the whole group, so all four worlds share one probe stack.
     worlds:
       fixed:
         network: ky7
         districting: manual
-        sim_seed: 42
-        n_months: 50                 # the pre-flight needs >= 46 here
+        sim_seed: 43                 # must differ from probe.seed (42)
+        n_months: auto               # auto_horizon in parameters.yml
         days_per_month: 30
         seasonality_scale: 1.0
         drift_ramp_days: 42
         beta: 0.35
         consumption_map: LI_LR_LI_LI
         coupling: {variant: baseline, close_fraction: 0.0}
-        drift: {tgt_district: District_A, warmup_months: 12,
-                to_income: low, to_land_use: residential}
+        drift_all_districts: true    # K worlds; no drift target here
+        drift: {max_neighbors_per_month: auto, convert_months: 12}
         placement:
           source: dynamic
           probe: {horizon: world, seasonality: world, diffusion: planned,
-                  seed: world, retain_series: true}
+                  retain_series: true}
         oracle:
           tiers: [1, 4]
           n_surrogates: 20
           n_surrogates_expensive: 8
           minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
       # grid:
-      #   sim_seed: [42, 43, 44]     # replicates: one stack + K probe worlds each
+      #   sim_seed: [43, 44, 45]     # replicates: still ONE stack, one horizon
     runs:
       fixed: {rounds: 8}
       grid:
         fl_seed: [0, 1, 2]
-    promote_probes: probes_only
 
 
 
@@ -260,6 +264,53 @@ studies:
       fixed: {rounds: 8}
     pipelines: []
     harvest: [validation]
+
+
+  ky72_districting_all_districts:
+    description: >
+      KY7 on two generated partitions: every district drifts in turn to its
+      probe transition, as independent worlds (sim_seed 43 vs probe seed 42),
+      30-day months, auto front and auto horizon -- one n_months and ONE probe
+      stack per partition. Worlds only; FL not run.
+      Expands to 8 worlds; auto horizon resolves to 66 months (spectral) and
+      70 months (girvan_newman); engine pre-flight passes.
+    worlds:
+      fixed:
+        network: ky72
+        sim_seed: 43                 # must differ from probe.seed (42)
+        n_months: auto               # auto_horizon: 12 pre, 12 post, 3 spare
+        days_per_month: 30
+        seasonality_scale: 0.0       # off for world AND probes
+        drift_ramp_days: 7
+        anchor_scale: 0.50
+        beta: 0.35
+        consumption_map: LR_LR_LC_LI
+        coupling: {variant: baseline, close_fraction: 0.0}
+        drift_all_districts: true    # K worlds per partition; no drift target
+        drift: {max_neighbors_per_month: auto, convert_months: 12}
+        placement:
+          source: dynamic
+          slots:
+            flow:     {pure: 2, mixed: 2}
+            pressure: {pure: 2, mixed: 2}
+          probe: {horizon: world, seasonality: world, diffusion: planned}
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+      grid:
+        districting: [spectral, girvan_newman]
+    runs:
+      fixed: {rounds: 8}
+    pipelines: []
+    harvest: [validation]
+
+
+
+
+
+
   # ---------------------------------------------- D-Town component probe --
   # FIRST STUDY ON A NETWORK WHERE PUMPS AND VALVES ARE LOAD-BEARING: 11 pumps
   # on 3-point HEAD curves, 5 valves (4 PRV + 1 TCV), 24 controls, 7 tanks.

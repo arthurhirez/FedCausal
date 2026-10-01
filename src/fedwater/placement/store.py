@@ -178,7 +178,21 @@ def stack_spec(*, network: str, partition: dict, world: dict, probe: dict,
     drift_mech = {k: v for k, v in (scen.get("drift") or {}).items()
                   if k not in ("tgt_district", "seed_node", "to_income",
                                "to_land_use", "warmup_months", "growth_chance",
-                               "max_neighbors_per_month")}
+                               "max_neighbors_per_month", "convert_months")}
+    plan_id = {k: plan[k] for k in (
+        "n_months", "days_per_month", "warmup_months", "drift_ramp_days",
+        "seasonality_scale", "season_aligned", "growth_chance",
+        "max_neighbors_per_month")}
+    if plan["max_neighbors_per_month"] == "auto":
+        # diffusion: world under an auto front -- each probe district's width
+        # comes from the world's convert_months, so it is the probes' physics
+        plan_id["convert_months"] = int(scen["drift"]["convert_months"])
+    analysis = {k: classes[k] for k in (
+        "null_factor", "null_factors", "core_purity", "foreign_max")}
+    if gate(classes) != "norm":
+        # only a non-default gate enters the identity: stacks built before
+        # the key existed used the norm gate and keep their hashes
+        analysis["gate"] = gate(classes)
     return {
         "network": network,
         "partition": {"method": partition["method"],
@@ -202,15 +216,23 @@ def stack_spec(*, network: str, partition: dict, world: dict, probe: dict,
         "probe": {**{k: probe[k] for k in (
             "transitions", "settle", "battery_max_lag_h", "top_carriers")},
             **plan["modes"]},
-        "plan": {k: plan[k] for k in (
-            "n_months", "days_per_month", "warmup_months", "drift_ramp_days",
-            "seasonality_scale", "season_aligned", "growth_chance",
-            "max_neighbors_per_month")}
-        | {"seeds": dict(zip(plan["seeds"]["district"],
-                             plan["seeds"]["seed_node"]))},
-        "analysis": {k: classes[k] for k in (
-            "null_factor", "null_factors", "core_purity", "foreign_max")},
+        "plan": plan_id | {"seeds": dict(zip(plan["seeds"]["district"],
+                                             plan["seeds"]["seed_node"]))},
+        "analysis": analysis,
     }
+
+
+GATES = ("norm", "projection")
+
+
+def gate(classes: dict) -> str:
+    """``sensor_placement.classes.gate`` -- which noise test admits a cell
+    into the mixture (see ``mixture_probe.remix``). Absent means ``norm``."""
+    g = str((classes or {}).get("gate", "norm"))
+    if g not in GATES:
+        raise ValueError(f"sensor_placement.classes.gate must be one of "
+                         f"{GATES}, got {g!r}")
+    return g
 
 
 def stack_dir(store_root, network: str, method: str, stack_hash: str) -> Path:
@@ -364,7 +386,8 @@ def analyze(stack: ProbeStack, probes: dict, beta: float, classes: dict,
     # -- the mixture (POC §2c) -------------------------------------------------
     base = mp.build_mixture(probes, null_factor=null_factor, core_purity=core,
                             foreign_max=foreign, verbose=verbose,
-                            season_aligned=season_aligned, **kw)
+                            season_aligned=season_aligned, gate=gate(classes),
+                            **kw)
     stack.base = base
     stack.mixture = base["mixture"]
     stack.gains = base["gains"]

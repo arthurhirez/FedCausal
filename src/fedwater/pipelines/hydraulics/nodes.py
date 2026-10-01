@@ -9,13 +9,86 @@ scales to get wrong (the 1/24 bug class is structurally impossible).
 from __future__ import annotations
 
 import copy
+import os
+import shutil
 import tempfile
+import time
+import warnings
 from pathlib import Path
 
 import pandas as pd
 import wntr
 
 UNIT_BASE_SI = 0.001  # 1 L/s in m3/s
+
+SCRATCH_PREFIX = "fedwater_epanet_"
+# Where EPANET's scratch files go. Defaults to the system temp directory; set
+# FEDWATER_SCRATCH to a drive with room (a 70-month hourly KY7 world writes
+# ~1.4 GB of .bin alone). Not part of any world's identity.
+SCRATCH_ENV = "FEDWATER_SCRATCH"
+# A scratch directory untouched this long is debris from a run that died
+# before cleaning up (a crash, a killed process, a lock that never cleared).
+STALE_HOURS = 24.0
+# Margin over the estimate: EPANET also writes its hydraulics scratch file.
+SPACE_MARGIN = 1.5
+
+
+def scratch_root() -> Path:
+    root = Path(os.environ.get(SCRATCH_ENV) or tempfile.gettempdir())
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def scratch_bytes(wn, n_steps: int) -> int:
+    """EPANET's binary results file for ``n_steps`` reported periods:
+    4 node and 8 link variables, 4-byte floats, per period (+ the t=0 one).
+    Checked against a real KY7 run: 27.3 kB per hourly period."""
+    return int((4 * wn.num_nodes + 8 * wn.num_links) * 4 * (n_steps + 1))
+
+
+def sweep_stale(root: Path, hours: float = STALE_HOURS) -> list[Path]:
+    """Delete scratch directories whose newest file is older than ``hours``.
+
+    Only directories carrying this module's prefix, and only stale ones: a
+    concurrent run's directory is minutes old and is left alone.
+    """
+    removed, cutoff = [], time.time() - hours * 3600
+    for d in Path(root).glob(f"{SCRATCH_PREFIX}*"):
+        if not d.is_dir():
+            continue
+        try:
+            newest = max([f.stat().st_mtime for f in d.rglob("*")]
+                         + [d.stat().st_mtime])
+        except OSError:
+            continue
+        if newest < cutoff and _remove(d, attempts=1):
+            removed.append(d)
+    return removed
+
+
+def _remove(path: Path, attempts: int = 6, pause: float = 0.5) -> bool:
+    """rmtree with retries. On Windows a file EPANET (or an antivirus scan)
+    still holds cannot be deleted for a moment; retry, then give up quietly."""
+    for i in range(attempts):
+        try:
+            shutil.rmtree(path)
+            return True
+        except FileNotFoundError:
+            return True
+        except OSError:
+            if i + 1 < attempts:
+                time.sleep(pause * (i + 1))
+    return False
+
+
+def _check_space(root: Path, need: int) -> None:
+    free = shutil.disk_usage(root).free
+    if free < need * SPACE_MARGIN:
+        raise OSError(
+            f"run_hydraulics: EPANET needs ~{need / 1e9:.2f} GB of scratch "
+            f"(x{SPACE_MARGIN} margin) in {root}, which has "
+            f"{free / 1e9:.2f} GB free. Free space there, or point "
+            f"{SCRATCH_ENV} at a drive with room.")
 
 
 def run_hydraulics(wn, demand_series: pd.DataFrame):
@@ -40,10 +113,15 @@ def run_hydraulics(wn, demand_series: pd.DataFrame):
     KY7 world, for every world a study ever simulates, forever, since nothing
     in the engine's lifecycle touches a world's clone after it is built.
 
-    ``file_prefix`` is pointed at a :func:`tempfile.TemporaryDirectory`
-    instead, so the scratch files are born outside the project tree and the
-    directory (and everything EPANET wrote into it) is removed the moment
-    this function returns -- on the success path and on any exception.
+    ``file_prefix`` is pointed at a fresh directory under
+    :func:`scratch_root` instead, so the scratch files are born outside the
+    project tree and the directory is removed the moment this function
+    returns -- on the success path and on any exception -- with retries,
+    because on Windows a just-written file can stay locked for a moment.
+    Before solving, stale scratch left by dead runs is swept and the free
+    space is checked against the size of the results file, so a full disk
+    fails fast with its own message instead of as EPANET error 308 an hour
+    into the solve.
     ``networks.conditioning.solve`` already runs its own EPANET calls this
     way (via ``os.chdir`` into a scratch dir); this takes the same guarantee
     without the process-wide ``chdir``, which is the safer of the two once
@@ -70,9 +148,23 @@ def run_hydraulics(wn, demand_series: pd.DataFrame):
         print(f"run_hydraulics: {len(silenced)} junction(s) carry no portfolio "
               f"and were pinned to zero demand (e.g. {silenced[:5]}).")
 
-    with tempfile.TemporaryDirectory(prefix="fedwater_epanet_") as scratch:
+    root = scratch_root()
+    sweep_stale(root)
+    _check_space(root, scratch_bytes(wn, len(demand_series)))
+    scratch = Path(tempfile.mkdtemp(prefix=SCRATCH_PREFIX, dir=root))
+    try:
         results = wntr.sim.EpanetSimulator(wn).run_sim(
-            file_prefix=str(Path(scratch) / "run"))
+            file_prefix=str(scratch / "run"))
+    finally:
+        # Cleanup never raises: a scratch directory must not fail a world,
+        # and must never MASK the solver's own error (Python's
+        # TemporaryDirectory turned a locked .rpt into a NotADirectoryError
+        # that hid EPANET's actual failure). What cannot be removed now is
+        # swept by a later run once it is stale.
+        if not _remove(scratch):
+            warnings.warn(f"run_hydraulics: could not remove scratch "
+                          f"{scratch} (a file is still locked); it will be "
+                          f"swept once older than {STALE_HOURS:.0f} h.")
 
     pressures = results.node["pressure"]
     flows = results.link["flowrate"] * 1000.0  # m3/s -> L/s

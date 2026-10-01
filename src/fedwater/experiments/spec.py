@@ -48,6 +48,21 @@ written for one network means something different on another. The district
 count is now read from the selected bundle's ``districts.yml`` and validated
 rather than assumed to be 5.
 
+EVERY-DISTRICT DESIGN: ``drift_all_districts: true`` on a world expands it into
+K worlds, one per district of its partition, each drifting that district to
+the target ``sensor_placement.probe.transitions`` gives its initial land use
+(income kept) -- the probe stack's design as independent worlds. It refuses
+an explicit drift target, and a ``sim_seed`` equal to the probe seed (which
+would re-simulate the probe worlds: in-sample for the sensors chosen on them).
+
+AUTO HORIZON: ``n_months: auto`` sizes a world from its own drift schedule,
+replayed exactly (``urban_scenario.drift_completion``): ``auto_horizon.pre``
+drift-free months, the conversion, the last ramp, the settle pad,
+``auto_horizon.post`` settled months and ``auto_horizon.spare``. Worlds that
+would share a probe stack -- the same world up to the drift target and
+``sim_seed`` -- get ONE horizon, the largest need in the group, so they keep
+sharing it. The resolved ``n_months`` is identity; ``auto_horizon`` is not.
+
 LAND-USE REFACTOR: this module previously encoded a density axis, with both
 token positions drawn from {L, M, H}. Every consumption map and every drift
 target changed, so every world hash changed — ``data/09_experiments/worlds/``
@@ -57,6 +72,7 @@ from __future__ import annotations
 
 import copy
 import itertools
+import math
 import re
 from pathlib import Path
 
@@ -342,6 +358,9 @@ def resolve_world(world: dict, base_params: dict, network: str,
     # The districting dials themselves are not identity -- only their result
     # is -- so the block is dropped.
     effective.pop("districting", None)
+    # How an auto horizon is SIZED is not physics; the n_months (and
+    # warm-up) it resolves to are, and they are already in the blocks.
+    effective.pop("auto_horizon", None)
     effective["partition"] = {"method": partition["method"],
                               "partition_id": partition.get("partition_id")}
     # SENSOR PLACEMENT. Sensors are an OUTPUT of the world now (chosen by
@@ -471,6 +490,9 @@ def validate_world(resolved: dict, districts: dict) -> None:
             "network the id belongs to with `network: <name>` under "
             "worlds.fixed.")
 
+    from fedwater.pipelines.urban_scenario.nodes import drift_front
+    drift_front(eff["scenario"]["drift"], 1)      # int >= 1, or auto + months
+
     land_use_codes = set(eff["land_use"]["mix"])
     if flat["drift_to_land_use"] not in land_use_codes:
         raise ValueError(
@@ -538,6 +560,13 @@ def validate_placement(eff: dict) -> None:
                 f"has seasonality, but the probe warm-up is {warmup} month(s): "
                 f"whole-year windows need >= {SEASON_MONTHS} (raise "
                 "drift.warmup_months, or set probe.seasonality: none).")
+    try:
+        int((sp.get("probe") or {}).get("seed"))
+    except (TypeError, ValueError):
+        raise ValueError("sensor_placement.probe.seed must be an int, got "
+                         f"{(sp.get('probe') or {}).get('seed')!r}.") from None
+    from fedwater.placement.store import gate
+    gate(sp.get("classes") or {})
     ref = (sp.get("selection_coupling") or {}).get("variant")
     if ref not in ("baseline", "isolated"):
         raise ValueError("sensor_placement.selection_coupling.variant must be "
@@ -643,6 +672,126 @@ def study_partitions(name: str, project_root: Path) -> list[tuple[str, str]]:
                    for w in expand_axes(study.get("worlds"))})
 
 
+# --------------------------------------------------------------------------
+# every-district design and auto horizon
+# --------------------------------------------------------------------------
+_DRIFT_TARGET_KEYS = ("tgt_district", "to_income", "to_land_use", "seed_node")
+AUTO_HORIZON_KEYS = ("pre_months", "post_months", "spare_months")
+
+
+def all_district_worlds(world: dict, base_params: dict, network: str,
+                        districts: dict, profile: dict | None,
+                        partition: dict | None) -> list[dict]:
+    """``drift_all_districts: true`` -> one world per district, else ``[world]``.
+
+    District ``k`` drifts to ``probe.transitions[its initial land use]`` with
+    its income kept -- exactly the excitation its probe world applies, so
+    ``verify`` compares like with like. The world's own front, grid and seed
+    are untouched. Refused: an explicit drift target (it would be silently
+    overwritten), and ``sim_seed == probe.seed`` for dynamic sensors (the
+    worlds would reproduce the probe worlds the sensors were chosen on).
+    """
+    from fedwater.placement.excite import validate_transitions
+
+    world = copy.deepcopy(world)
+    if not world.pop("drift_all_districts", False):
+        return [world]
+    drift = dict(world.get("drift") or {})
+    clash = sorted(set(drift) & set(_DRIFT_TARGET_KEYS))
+    if clash:
+        raise ValueError(
+            f"drift_all_districts sets the drift target of every world; "
+            f"remove drift.{clash} from the study.")
+    names = list(district_nodes(districts))
+    probe = {k: v for k, v in world.items() if k != "n_months"}
+    eff = resolve_world(probe, base_params, network, len(names), profile,
+                        partition)["effective"]
+    sp = eff["sensor_placement"]
+    transitions = validate_transitions(sp["probe"]["transitions"],
+                                       eff["land_use"])
+    if (sp.get("source", "dynamic") == "dynamic"
+            and int(eff["seed"]) == int(sp["probe"]["seed"])):
+        raise ValueError(
+            f"drift_all_districts with sim_seed {eff['seed']} equal to "
+            "sensor_placement.probe.seed: these worlds would re-simulate the "
+            "probe worlds the sensors were selected on (in-sample). Use a "
+            "different sim_seed.")
+    out = []
+    for d, (income, land_use) in zip(names,
+                                     eff["scenario"]["income_landuse_mapping"]):
+        w = copy.deepcopy(world)
+        w["drift"] = {**drift, "tgt_district": d, "to_income": str(income),
+                      "to_land_use": transitions[str(land_use)]}
+        out.append(w)
+    return out
+
+
+def auto_horizon_config(base_params: dict, world: dict) -> dict:
+    """``auto_horizon`` (parameters.yml) patched by the world's own block."""
+    cfg = {**(base_params.get("auto_horizon") or {}),
+           **(world.get("auto_horizon") or {})}
+    missing = [k for k in AUTO_HORIZON_KEYS if k not in cfg]
+    unknown = sorted(set(cfg) - set(AUTO_HORIZON_KEYS))
+    if missing or unknown:
+        raise ValueError(f"auto_horizon needs exactly {AUTO_HORIZON_KEYS}; "
+                         f"missing {missing}, unknown {unknown}.")
+    cfg = {k: int(v) for k, v in cfg.items()}
+    if cfg["pre_months"] < 1 or cfg["post_months"] < 1 or cfg["spare_months"] < 0:
+        raise ValueError(f"auto_horizon {cfg}: pre/post >= 1, spare >= 0.")
+    return cfg
+
+
+def horizon_need(resolved: dict, wn, districts: dict, partition: dict,
+                 horizon: dict) -> dict:
+    """One world's minimal horizon, from its EXACT drift schedule.
+
+    ``need = last_switch + ceil(drift_ramp_days / days_per_month) + pad
+    + post_months + spare_months`` -- the settled window of
+    ``mixture_probe.season_windows`` (final phase + ``settle.pad``) followed by
+    ``post_months`` whole months and the spare. ``pre`` is the warm-up the
+    world already carries: the first switch is at ``warmup_months``.
+    """
+    from fedwater.pipelines.urban_scenario.nodes import drift_completion
+
+    eff = resolved["effective"]
+    done = drift_completion(wn, districts, partition, eff["scenario"],
+                            int(eff["seed"]))
+    dpm = int(eff["time"]["days_per_month"])
+    ramp_days = float(eff["patterns"].get("drift_ramp_days", 0) or 0)
+    ramp = math.ceil(ramp_days / dpm) if ramp_days > 0 else 0
+    pad = int(eff["sensor_placement"]["probe"]["settle"]["pad"])
+    need = (done["last_switch"] + ramp + pad + horizon["post_months"]
+            + horizon["spare_months"])
+    return {**done, "ramp_months": ramp, "pad": pad, "need": int(need)}
+
+
+def _group_key(network: str, method: str, world: dict) -> str:
+    """Worlds that differ only in drift target and sim_seed share a stack."""
+    k = copy.deepcopy(world)
+    for key in ("sim_seed", "n_months"):
+        k.pop(key, None)
+    k["drift"] = {a: b for a, b in (k.get("drift") or {}).items()
+                  if a not in _DRIFT_TARGET_KEYS}
+    return canonical_hash({"network": network, "method": method, "world": k})
+
+
+def _probe_fits(wn, districts, partition, resolved) -> bool:
+    """Would the world's probe schedule fit its horizon (engine pre-flight)?"""
+    from fedwater.placement import excite
+
+    eff = resolved["effective"]
+    sp = eff.get("sensor_placement") or {}
+    if sp.get("source", "dynamic") != "dynamic":
+        return True
+    try:
+        excite.horizon_plan(wn, districts, partition, sp["probe"],
+                            {k: eff[k] for k in ("time", "scenario",
+                                                 "patterns")})
+    except ValueError:
+        return False
+    return True
+
+
 def expand_study(name: str, project_root: Path) -> dict:
     """Resolve one named study into validated world specs x run specs.
 
@@ -651,6 +800,10 @@ def expand_study(name: str, project_root: Path) -> dict:
     ``conf/base/globals.yml``. Each world carries its own bundle, so a study
     MAY mix networks -- though a positional ``consumption_map`` is only
     comparable across networks with the same district count and ordering.
+
+    ``drift_all_districts`` and ``n_months: auto`` are resolved here (module
+    docstring); an auto world needs the network's graph, loaded once per
+    network.
     """
     project_root = Path(project_root)
     cfg = load_studies(project_root)
@@ -663,7 +816,7 @@ def expand_study(name: str, project_root: Path) -> dict:
     fallback_method = default_partition(project_root)
 
     pipelines = tuple(study.get("pipelines", DEFAULT_PIPELINES))
-    worlds, bundles = [], {}
+    entries, bundles = [], {}
     for w in expand_axes(study.get("worlds")):
         w = copy.deepcopy(w)
         network = w.pop("network", fallback)
@@ -672,28 +825,77 @@ def expand_study(name: str, project_root: Path) -> dict:
         if key not in bundles:
             bundles[key] = bundle(project_root, network, method)
         b = bundles[key]
-        districts, inp = b["districts"], b["inp"]
+        districts = b["districts"]
         n_districts = len(district_nodes(districts))
+        expanded = all_district_worlds(w, base, network, districts,
+                                       b["profile"], b["partition"])
+        for wk in expanded:
+            horizon = None
+            if wk.get("n_months") == "auto":
+                horizon = auto_horizon_config(base, wk)
+                wk.pop("n_months")
+                wk.pop("auto_horizon", None)
+                if "warmup_months" not in (wk.get("drift") or {}):
+                    wk = _deep_merge(wk, {"drift": {
+                        "warmup_months": horizon["pre_months"]}})
+            elif "auto_horizon" in wk:
+                raise ValueError("auto_horizon is read only with "
+                                 "n_months: auto.")
+            wk, resolved = _resolve_seeded(wk, base, network, n_districts, b)
+            entries.append({"w": wk, "key": key, "resolved": resolved,
+                            "horizon": horizon,
+                            "all_districts": len(expanded) > 1
+                            or bool(w.get("drift_all_districts"))})
 
-        resolved = resolve_world(w, base, network, n_districts, b["profile"],
-                                 b["partition"])
-        if resolved["flat"]["drift_seed_node"] is None:
-            # Precedence (explicit > partition seed source > auto) lives in
-            # ONE function, shared with build_drift_schedule, so the engine
-            # and a plain `kedro run` cannot pick different origins. The seed
-            # source is `partition_meta` -- the profile's drift_seed_nodes for
-            # the manual partition, none for a generated one. The auto-picker
-            # passed here is the .inp-TEXT one, which keeps spec expansion
-            # free of a wntr load; it agrees with the model-based picker in
-            # networks.partition on every district of every bundle.
-            tgt = resolved["flat"]["drift_district"]
-            node = nprofile.resolve_seed_node(
-                None, b["partition"], tgt,
-                lambda: auto_seed_node(tgt, districts, inp))
-            w = _deep_merge(w, {"drift": {"seed_node": node}})
-            resolved = resolve_world(w, base, network, n_districts,
-                                     b["profile"], b["partition"])
-        validate_world(resolved, districts)
+    # -- auto horizons: one per stack-sharing group ---------------------------
+    groups: dict[str, list] = {}
+    for e in entries:
+        if e["horizon"] is not None:
+            groups.setdefault(_group_key(*e["key"], e["w"]), []).append(e)
+    models = {}
+    for members in groups.values():
+        network, method = members[0]["key"]
+        b = bundles[(network, method)]
+        if network not in models:
+            import wntr
+            models[network] = wntr.network.WaterNetworkModel(
+                str(pstore.bundle_dir(project_root, network) / "network.inp"))
+        wn = models[network]
+        for e in members:
+            e["need"] = horizon_need(e["resolved"], wn, b["districts"],
+                                     b["partition"], e["horizon"])
+        n = max(e["need"]["need"] for e in members)
+        n_districts = len(district_nodes(b["districts"]))
+
+        def at(e, n):
+            return resolve_world({**e["w"], "n_months": n}, base, network,
+                                 n_districts, b["profile"], b["partition"])
+
+        # the probes may need more than the worlds (horizon: world): grow the
+        # group's horizon until the pre-flight's own plan fits
+        for _ in range(600):
+            if _probe_fits(wn, b["districts"], b["partition"],
+                           at(members[0], n)):
+                break
+            n += 1
+        else:
+            raise ValueError(f"auto horizon: no n_months <= {n} fits the "
+                             f"probe schedule of {network}/{method}.")
+        for e in members:
+            e["w"] = {**e["w"], "n_months": n}
+            e["resolved"] = at(e, n)
+
+    worlds = []
+    for e in entries:
+        resolved = e["resolved"]
+        flat = resolved["flat"]
+        flat["n_months_auto"] = e["horizon"] is not None
+        flat["drift_last_switch"] = (e["need"]["last_switch"]
+                                     if e["horizon"] is not None else None)
+        flat["all_districts"] = e["all_districts"]
+        if e["horizon"] is not None:
+            _check_auto_horizon(resolved, e["horizon"], e["need"])
+        validate_world(resolved, bundles[e["key"]]["districts"])
         worlds.append(resolved)
     runs = [resolve_run(r, base, pipelines) for r in expand_axes(study.get("runs"))]
 
@@ -711,3 +913,42 @@ def expand_study(name: str, project_root: Path) -> dict:
             "retain": tuple(study.get("retain", ())),
             "root": cfg.get("root", "data/09_experiments"),
             "description": study.get("description", "")}
+
+
+def _resolve_seeded(w: dict, base: dict, network: str, n_districts: int,
+                    b: dict) -> tuple[dict, dict]:
+    """``resolve_world`` with the drift seed node pinned explicitly."""
+    resolved = resolve_world(w, base, network, n_districts, b["profile"],
+                             b["partition"])
+    if resolved["flat"]["drift_seed_node"] is None:
+        # Precedence (explicit > partition seed source > auto) lives in
+        # ONE function, shared with build_drift_schedule, so the engine
+        # and a plain `kedro run` cannot pick different origins. The seed
+        # source is `partition_meta` -- the profile's drift_seed_nodes for
+        # the manual partition, none for a generated one. The auto-picker
+        # passed here is the .inp-TEXT one, which keeps spec expansion
+        # free of a wntr load; it agrees with the model-based picker in
+        # networks.partition on every district of every bundle.
+        tgt = resolved["flat"]["drift_district"]
+        node = nprofile.resolve_seed_node(
+            None, b["partition"], tgt,
+            lambda: auto_seed_node(tgt, b["districts"], b["inp"]))
+        w = _deep_merge(w, {"drift": {"seed_node": node}})
+        resolved = resolve_world(w, base, network, n_districts,
+                                 b["profile"], b["partition"])
+    return w, resolved
+
+
+def _check_auto_horizon(resolved: dict, horizon: dict, need: dict) -> None:
+    """With seasonality on, both sides must hold whole years (season_windows)."""
+    from fedwater.placement.mixture_probe import SEASON_MONTHS
+
+    eff = resolved["effective"]
+    if float(eff["patterns"].get("seasonality_scale", 0) or 0) <= 0:
+        return
+    warmup = int(eff["scenario"]["drift"]["warmup_months"])
+    if warmup < SEASON_MONTHS or horizon["post_months"] < SEASON_MONTHS:
+        raise ValueError(
+            f"n_months: auto with seasonality on needs >= {SEASON_MONTHS} "
+            f"drift-free months (warm-up {warmup}) and auto_horizon."
+            f"post_months >= {SEASON_MONTHS} (got {horizon['post_months']}).")

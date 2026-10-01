@@ -469,7 +469,8 @@ def horizon_check(probes: dict, ref_months: int = 3, slack: float = 0.01,
 def build_mixture(probes: dict, slack: float = 0.01, pad: int = 1,
                   ref_months: int = 3, null_factor: float = 3.0,
                   core_purity: float = 0.85, foreign_max: float = 0.15,
-                  verbose: bool = True, season_aligned: bool = False) -> dict:
+                  verbose: bool = True, season_aligned: bool = False,
+                  gate: str = "norm") -> dict:
     """Stack one world per drifting district -> the mixture table.
 
     ``season_aligned`` measures every world on whole-year windows
@@ -546,30 +547,53 @@ def build_mixture(probes: dict, slack: float = 0.01, pad: int = 1,
     degenerate = NULL.to_numpy() < floor
     NULL = pd.Series(np.maximum(NULL.to_numpy(), floor), index=NULL.index,
                      name="null")
-    base = {"degenerate": pd.Series(degenerate, index=NULL.index), "gains": gains,
+    base = {"gate": gate,
+            "degenerate": pd.Series(degenerate, index=NULL.index), "gains": gains,
             "PROJ": PROJ, "NU": NU, "EXC": EXC,
             "PROJ_native": PROJ_N, "NU_native": NU_N, "EXC_native": EXC_N,
             "G": G, "DZ": DZ, "null": NULL,
             "districts": districts, "cand": cand}
     return remix(base, null_factor=null_factor, core_purity=core_purity,
-                 foreign_max=foreign_max)
+                 foreign_max=foreign_max, gate=gate)
 
 
 def remix(base: dict, null_factor: float = 3.0, core_purity: float = 0.85,
-          foreign_max: float = 0.15) -> dict:
+          foreign_max: float = 0.15, gate: str | None = None) -> dict:
     """Recompute the mixture from stored gains -- no re-profiling, no solving.
 
     Exists so the two thresholds can be swept cheaply. They are choices, and a
     result that moves a lot between `null_factor` 2 and 4 is a result about
     the threshold rather than about the network.
+
+    ``gate`` -- which noise test admits a (gauge, district) cell into the
+    simplex. Omitted, the one the mixture was built with (``base["gate"]``,
+    ``norm`` for a base built before the key existed):
+
+    ``norm``        ``||dz_s|| > null_factor * null_s``: the gauge's whole
+                    shape change against the split-half norm floor. Stable
+                    floor, but it tests the MOVEMENT, not the quantity that
+                    becomes mass (``g``, the projection on the district's own
+                    change), and it is not the rule ``elasticity`` uses.
+    ``projection``  ``|proj_s,k| > null_factor * nu_s,k``: the projection
+                    against the split-half noise projected on the same
+                    direction -- the quantity that becomes mass, and the noise
+                    ``elasticity`` / ``dependence`` soft-threshold against, so
+                    tiers and D/R agree. ``nu`` is ONE noise draw per cell.
     """
     districts, G, DZ = base["districts"], base["G"], base["DZ"]
     NULL, cand = base["null"], base["cand"]
+    gate = gate or base.get("gate", "norm")
 
     # Only responses that clear the null carry mixture mass. A negative gain is
     # a real anti-phase response and is recorded separately rather than folded
     # into the simplex, where it would have no meaning.
-    live = DZ.to_numpy() > (null_factor * NULL.to_numpy()[:, None])
+    if gate == "norm":
+        live = DZ.to_numpy() > (null_factor * NULL.to_numpy()[:, None])
+    elif gate == "projection":
+        live = (np.abs(base["PROJ"].to_numpy())
+                > null_factor * base["NU"].to_numpy())
+    else:
+        raise ValueError(f"gate must be 'norm' or 'projection', got {gate!r}")
     pos = np.where(live, np.clip(G.to_numpy(), 0, None), 0.0)
     neg = np.where(live, np.clip(G.to_numpy(), None, 0), 0.0)
     tot = pos.sum(axis=1)
@@ -616,7 +640,8 @@ def remix(base: dict, null_factor: float = 3.0, core_purity: float = 0.85,
                    foreign_max=foreign_max)
     out = dict(base)
     out.update({"mixture": mix, "null_factor": null_factor,
-                "core_purity": core_purity, "foreign_max": foreign_max})
+                "core_purity": core_purity, "foreign_max": foreign_max,
+                "gate": gate})
     return out
 
 

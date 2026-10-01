@@ -68,6 +68,7 @@ import pandas as pd
 from fedwater.networks import profile as nprofile
 from fedwater.placement.mixture_probe import SEASON_MONTHS
 from fedwater.networks.partition import auto_seed_node, district_nodes
+from fedwater.pipelines.urban_scenario.nodes import drift_front
 
 __all__ = ["validate_transitions", "excitation", "horizon_plan", "probe_modes",
            "probe_params", "core_pipeline", "simulate_probe", "PROBE_TARGETS"]
@@ -195,9 +196,16 @@ def horizon_plan(wn, districts: dict, seed_source: dict, probe: dict,
     # -- the front ----------------------------------------------------------
     if modes["diffusion"] == "world":
         wdrift = world["scenario"]["drift"]
-        front = int(wdrift["max_neighbors_per_month"])
+        # the world's front, resolved PER probe district by the same rule the
+        # world's own schedule uses: under `auto` each district gets its own
+        # width, so the binding district is not necessarily the largest one
+        widths = {r["district"]: drift_front(wdrift, r["n_nodes"])
+                  for _, r in seeds.iterrows()}
+        front = ("auto" if wdrift.get("max_neighbors_per_month") == "auto"
+                 else widths[seeds["district"].iloc[0]])
         growth = float(wdrift["growth_chance"])
-        conv = max(math.ceil(largest / front), max_ecc)
+        conv = max(max(math.ceil(r["n_nodes"] / widths[r["district"]]),
+                       int(r["eccentricity"])) for _, r in seeds.iterrows())
         conv = math.ceil(conv / growth) if growth > 0 else conv
     else:
         growth = float(probe["growth_chance"])
@@ -230,11 +238,12 @@ def horizon_plan(wn, districts: dict, seed_source: dict, probe: dict,
             f"needs with diffusion={modes['diffusion']} (largest district "
             f"{largest} nodes, front {front}/month, growth {growth}); lengthen "
             "the world or use diffusion: planned")
+    front = front if front == "auto" else int(front)
     return {"modes": modes, "n_months": int(months), "need_n_months": int(need),
             "days_per_month": dpm, "warmup_months": warmup,
             "drift_ramp_days": ramp_days, "seasonality_scale": seasonality,
             "season_aligned": aligned, "settled_months": settled,
-            "growth_chance": growth, "max_neighbors_per_month": int(front),
+            "growth_chance": growth, "max_neighbors_per_month": front,
             "convert_months": int(conv), "largest_district": largest,
             "max_eccentricity": max_ecc, "seeds": seeds}
 
@@ -267,7 +276,12 @@ def probe_params(world: dict, probe: dict, plan: dict, district: str,
         "seed_node": None,
         "warmup_months": int(plan["warmup_months"]),
         "growth_chance": float(plan["growth_chance"]),
-        "max_neighbors_per_month": int(plan["max_neighbors_per_month"]),
+        # an int, or `auto` (diffusion: world under an auto front): the probe
+        # district then resolves its own width from the world's
+        # convert_months, carried over with the rest of the drift block
+        "max_neighbors_per_month": (
+            "auto" if plan["max_neighbors_per_month"] == "auto"
+            else int(plan["max_neighbors_per_month"])),
         **excitation(regime, transitions),
     }
     patterns = {**copy.deepcopy(world["patterns"]),

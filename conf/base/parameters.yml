@@ -58,6 +58,21 @@ time:
                         # monthly shape slightly rather than leaking volume.
   resolution_h: 1       # sensor/pattern resolution in hours
 
+# How a study's `n_months: auto` is sized (experiments.spec.horizon_need):
+#   n_months = last_switch + ceil(drift_ramp_days / days_per_month)
+#              + sensor_placement.probe.settle.pad + post_months + spare_months
+# where last_switch comes from REPLAYING the world's own drift schedule
+# (exact, not an estimate), and the warm-up is pre_months unless the study
+# sets drift.warmup_months itself. Worlds that would share a probe stack
+# (same world up to drift target and sim_seed) get the LARGEST need of their
+# group. With seasonality on, pre and post must be >= 12 (whole-year windows).
+# Engine-only (a plain `kedro run` needs an int), and NOT world identity: the
+# resolved n_months / warm-up are.
+auto_horizon:
+  pre_months: 12
+  post_months: 12
+  spare_months: 3
+
 hydraulics:
   anchor_scale: null    # NETWORK-SCOPED. node demand anchor = inp base demand
                         # x this scale. Graeme 0.05, KY7 0.5 -- the difference
@@ -172,6 +187,11 @@ scenario:
                                 # the front advances one BFS ring per month, so
                                 # a short horizon leaves the district only
                                 # partially converted.
+                                # int, or `auto` = ceil(n_target /
+                                # convert_months), n_target the drifting
+                                # district's junction count. `auto` REQUIRES
+                                # `convert_months: <int>` next to it (no
+                                # default, so no existing world hash moves).
     to_income: low
     to_land_use: commercial
 
@@ -391,6 +411,17 @@ sensor_placement:
                              # `null_factors` (1.0 disables the gate)
     null_factor: 1.5         # a response counts when |proj| > factor x noise
     null_factors: [1.0, 1.5, 3.0]
+    # gate: norm             # which noise test admits a (gauge, district)
+                             # cell into the mixture:
+                             #   norm       ||dz|| > null_factor x split-half
+                             #              norm floor (default; the rule
+                             #              every existing stack was built on)
+                             #   projection |proj| > null_factor x the noise
+                             #              projected on the same direction
+                             #              (the rule elasticity/dependence use)
+                             # Left commented: absent == norm, and only a
+                             # non-norm gate enters world and stack identity,
+                             # so no existing hash moves.
   dedupe_min_distance: 0.10  # two gauges closer than this read the same thing
 
   # Sensors are SELECTED on a stack at this coupling (baseline | isolated), so
