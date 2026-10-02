@@ -202,7 +202,8 @@ def classification(res) -> pd.DataFrame:
         return pd.DataFrame()
     cols = ["id", "element", "kind", "home", "role", "tier", "purity",
             "second", "w_second", "snr_home", "n_live", "n_mass", "mass",
-            "hhi", "entropy", "neg_mass", "degenerate_null"]
+            "hhi", "entropy", "neg_mass", "anti_phase_share", "home_phase",
+            "second_phase", "degenerate_null"]
     m = res.mixture[[c for c in cols if c in res.mixture.columns]].copy()
     wcols = _w_cols(res.mixture)
     m = pd.concat([m, res.mixture[wcols]], axis=1)

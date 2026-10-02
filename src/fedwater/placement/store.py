@@ -190,9 +190,12 @@ def stack_spec(*, network: str, partition: dict, world: dict, probe: dict,
     analysis = {k: classes[k] for k in (
         "null_factor", "null_factors", "core_purity", "foreign_max")}
     if gate(classes) != "norm":
-        # only a non-default gate enters the identity: stacks built before
-        # the key existed used the norm gate and keep their hashes
+        # only a non-norm gate enters the identity: stacks built before the
+        # key existed used the norm gate and keep their hashes
         analysis["gate"] = gate(classes)
+    if mixture_rule(classes) != "positive":
+        # same for the simplex rule: absent from every pre-existing stack
+        analysis["mixture"] = mixture_rule(classes)
     return {
         "network": network,
         "partition": {"method": partition["method"],
@@ -223,6 +226,18 @@ def stack_spec(*, network: str, partition: dict, world: dict, probe: dict,
 
 
 GATES = ("norm", "projection")
+MIXTURES = ("positive", "magnitude")
+
+
+def mixture_rule(classes: dict) -> str:
+    """``sensor_placement.classes.mixture`` -- what a live cell contributes
+    to the simplex (see ``mixture_probe.remix``). Absent means ``positive``,
+    the rule every stack built before the key existed used."""
+    m = str((classes or {}).get("mixture", "positive"))
+    if m not in MIXTURES:
+        raise ValueError(f"sensor_placement.classes.mixture must be one of "
+                         f"{MIXTURES}, got {m!r}")
+    return m
 
 
 def gate(classes: dict) -> str:
@@ -291,11 +306,36 @@ def load_world(path, district: str, districts: dict | None = None) -> dict:
 
 
 def load_probes(path) -> dict:
-    """``{district: Probe}`` for every retained world of a stack."""
+    """``{district: Probe}`` for every retained world of a stack. A stack
+    built by re-analysing another's worlds reads them from there."""
     path = Path(path)
     districts = yaml.safe_load((path / "districts.yml").read_text())
-    return {d: sp.Probe.from_world(load_world(path, d, districts))
+    mf = _read_json(path / "manifest.json") or {}
+    src = path.parent / mf["probes_from"] if mf.get("probes_from") else path
+    return {d: sp.Probe.from_world(load_world(src, d, districts))
             for d in districts["districts"]}
+
+
+def physics(spec: dict) -> dict:
+    """The part of a stack spec that decides its SIMULATIONS: everything but
+    ``analysis`` (gate, mixture rule, thresholds)."""
+    return {k: v for k, v in spec.items() if k != "analysis"}
+
+
+def _physics_donor(parent: Path, spec: dict, names: list) -> Path | None:
+    """An ok sibling stack with the same physics and every probe world
+    retained (its own, not borrowed: a chain of pointers is never built)."""
+    if not parent.exists():
+        return None
+    want = canonical_hash(physics(spec))
+    for d in sorted(parent.iterdir()):
+        mf = _read_json(d / "manifest.json") or {}
+        if (mf.get("status") == "ok" and not mf.get("probes_from")
+                and canonical_hash(physics(mf.get("spec", {}))) == want
+                and all((d / "worlds" / n / "params.yml").exists()
+                        for n in names)):
+            return d
+    return None
 
 
 # ==========================================================================
@@ -387,6 +427,7 @@ def analyze(stack: ProbeStack, probes: dict, beta: float, classes: dict,
     base = mp.build_mixture(probes, null_factor=null_factor, core_purity=core,
                             foreign_max=foreign, verbose=verbose,
                             season_aligned=season_aligned, gate=gate(classes),
+                            mixture=mixture_rule(classes),
                             **kw)
     stack.base = base
     stack.mixture = base["mixture"]
@@ -560,8 +601,20 @@ def ensure_stack(*, store_root, spec: dict, inputs: dict, world: dict,
          "assets": districts.get("assets") or {}}, sort_keys=False))
     try:
         regimes = dict(zip(names, world["scenario"]["income_landuse_mapping"]))
+        donor = _physics_donor(path.parent, spec, names)
         probes = {}
-        for d in names:
+        if donor is not None:
+            # An analysis-only change (gate, mixture rule, thresholds): the
+            # probe worlds are the SAME simulations, already on disk. Analyse
+            # them again instead of re-simulating K worlds, and point at them
+            # rather than copying gigabytes of series.
+            probes = load_probes(donor)
+            manifest["probes_from"] = donor.name
+            if verbose:
+                print(f"probe stack {network}/{method}/{h}: re-analysing the "
+                      f"probe worlds of {donor.name} (same physics)",
+                      flush=True)
+        for d in (names if donor is None else ()):
             if verbose:
                 ex = excite.excitation(regimes[d], transitions)
                 print(f"probe stack {network}/{method}/{h}: {d} "

@@ -73,7 +73,8 @@ _KIND_PREFIX = sp._PREFIX                     # {"pressure": "p_", "flow": "q_"}
 
 # label / selection columns carried per sensor
 _LABEL_COLS = ("tier", "purity", "second", "w_second", "n_live", "n_mass",
-               "mass", "hhi", "entropy", "neg_mass", "snr_home",
+               "mass", "hhi", "entropy", "neg_mass", "anti_phase_share",
+               "home_phase", "second_phase", "snr_home",
                "degenerate_null", "purity_swing", "tier_stable")
 _SEL_COLS = ("tier", "purity", "second", "w_second", "n_mass", "snr_home",
              "purity_swing", "served_own", "r_res_own_init", "response_mean")

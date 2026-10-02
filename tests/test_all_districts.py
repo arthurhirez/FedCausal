@@ -239,10 +239,13 @@ def test_gate_default_keeps_every_stack_identity(ky7):
             network="ky7", partition=b["partition"], world=world, probe=probe,
             classes=classes, plan=plan, coupling={"variant": "baseline"},
             seed=42))
-    classes = copy.deepcopy(BASE["sensor_placement"]["classes"])
-    assert "gate" not in classes
+    # a stack built before the keys existed: no gate, no mixture rule
+    classes = {k: v for k, v in BASE["sensor_placement"]["classes"].items()
+               if k not in ("gate", "mixture")}
     assert h({**classes, "gate": "norm"}) == h(classes)
+    assert h({**classes, "mixture": "positive"}) == h(classes)
     assert h({**classes, "gate": "projection"}) != h(classes)
+    assert h({**classes, "mixture": "magnitude"}) != h(classes)
     with pytest.raises(ValueError, match="gate"):
         store.gate({"gate": "both"})
 
@@ -264,6 +267,8 @@ def test_gate_rule_holds_cell_by_cell_on_a_real_stack(tmp_path,
     params, _ = resolve_params(BASE, profile)
     sp = copy.deepcopy(params["sensor_placement"])
     sp["probe"].update(warmup_months=4, settled_months=5, days_per_month=7)
+    # built under the norm gate so each gate's rule is checked from one base
+    sp["classes"].update(gate="norm", mixture="positive")
     world = {k: params[k] for k in ("hydraulics", "scenario", "validation",
                                     "time", "land_use", "buildings",
                                     "patterns")}

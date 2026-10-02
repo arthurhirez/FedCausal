@@ -470,7 +470,7 @@ def build_mixture(probes: dict, slack: float = 0.01, pad: int = 1,
                   ref_months: int = 3, null_factor: float = 3.0,
                   core_purity: float = 0.85, foreign_max: float = 0.15,
                   verbose: bool = True, season_aligned: bool = False,
-                  gate: str = "norm") -> dict:
+                  gate: str = "norm", mixture: str = "positive") -> dict:
     """Stack one world per drifting district -> the mixture table.
 
     ``season_aligned`` measures every world on whole-year windows
@@ -547,18 +547,19 @@ def build_mixture(probes: dict, slack: float = 0.01, pad: int = 1,
     degenerate = NULL.to_numpy() < floor
     NULL = pd.Series(np.maximum(NULL.to_numpy(), floor), index=NULL.index,
                      name="null")
-    base = {"gate": gate,
+    base = {"gate": gate, "mixture_rule": mixture,
             "degenerate": pd.Series(degenerate, index=NULL.index), "gains": gains,
             "PROJ": PROJ, "NU": NU, "EXC": EXC,
             "PROJ_native": PROJ_N, "NU_native": NU_N, "EXC_native": EXC_N,
             "G": G, "DZ": DZ, "null": NULL,
             "districts": districts, "cand": cand}
     return remix(base, null_factor=null_factor, core_purity=core_purity,
-                 foreign_max=foreign_max, gate=gate)
+                 foreign_max=foreign_max, gate=gate, mixture=mixture)
 
 
 def remix(base: dict, null_factor: float = 3.0, core_purity: float = 0.85,
-          foreign_max: float = 0.15, gate: str | None = None) -> dict:
+          foreign_max: float = 0.15, gate: str | None = None,
+          mixture: str | None = None) -> dict:
     """Recompute the mixture from stored gains -- no re-profiling, no solving.
 
     Exists so the two thresholds can be swept cheaply. They are choices, and a
@@ -579,6 +580,22 @@ def remix(base: dict, null_factor: float = 3.0, core_purity: float = 0.85,
                     direction -- the quantity that becomes mass, and the noise
                     ``elasticity`` / ``dependence`` soft-threshold against, so
                     tiers and D/R agree. ``nu`` is ONE noise draw per cell.
+
+    ``mixture`` -- what a live cell contributes to the simplex. Omitted, the
+    rule the mixture was built with (``base["mixture_rule"]``, ``positive``
+    for a base built before the key existed):
+
+    ``positive``    ``g+`` only; anti-phase gains go to ``neg_mass``. A gauge
+                    whose own-district response is ANTI-phase then shows only
+                    the crumbs of its positive gains, renormalised to 100% --
+                    "foreign" by construction (KY7: q_P-287, own E -0.25, read
+                    as "100% D" from a D gain of 0.007).
+    ``magnitude``   ``|g|``: the simplex says which districts move the gauge
+                    and by how much, whatever the direction -- the quantity
+                    ``dependence`` already averages (``|E|``). The direction
+                    is kept, not folded away: ``phase_<District>`` (+1 / -1 /
+                    0 per live cell), ``anti_phase_share`` (anti-phase share
+                    of the gauge's mass) and ``second_phase``.
     """
     districts, G, DZ = base["districts"], base["G"], base["DZ"]
     NULL, cand = base["null"], base["cand"]
@@ -594,15 +611,25 @@ def remix(base: dict, null_factor: float = 3.0, core_purity: float = 0.85,
                 > null_factor * base["NU"].to_numpy())
     else:
         raise ValueError(f"gate must be 'norm' or 'projection', got {gate!r}")
-    pos = np.where(live, np.clip(G.to_numpy(), 0, None), 0.0)
-    neg = np.where(live, np.clip(G.to_numpy(), None, 0), 0.0)
-    tot = pos.sum(axis=1)
-    M = np.divide(pos, tot[:, None], out=np.zeros_like(pos), where=tot[:, None] > EPS)
-    # `n_live` counts responses that cleared the null; `n_mass` those that also
-    # point the same way as the district's own change. A gauge whose only live
-    # response is ANTI-phase carries no mixture mass, and calling it a
-    # transition gauge would put a zero row on the simplex.
-    n_mass = (pos > 0).sum(axis=1)
+    mixture = mixture or base.get("mixture_rule", "positive")
+    if mixture not in ("positive", "magnitude"):
+        raise ValueError(f"mixture must be 'positive' or 'magnitude', "
+                         f"got {mixture!r}")
+    g = G.to_numpy()
+    pos = np.where(live, np.clip(g, 0, None), 0.0)
+    neg = np.where(live, np.clip(g, None, 0), 0.0)
+    mass_cells = pos if mixture == "positive" else pos - neg     # |g| on live
+    tot = mass_cells.sum(axis=1)
+    M = np.divide(mass_cells, tot[:, None], out=np.zeros_like(mass_cells),
+                  where=tot[:, None] > EPS)
+    # `n_live` counts responses that cleared the null; `n_mass` those that
+    # carry simplex mass -- under `positive`, only the in-phase ones, so a
+    # gauge whose only live response is ANTI-phase carries no mass there.
+    n_mass = (mass_cells > 0).sum(axis=1)
+    phase = np.where(live & (np.abs(g) > EPS), np.sign(g), 0.0)
+    absmass = pos.sum(axis=1) - neg.sum(axis=1)
+    anti_share = np.divide(-neg.sum(axis=1), absmass, out=np.zeros(len(g)),
+                           where=absmass > EPS)
 
     home = cand.set_index("id")["district"].reindex(G.index).to_numpy()
     hidx = np.array([districts.index(h) if h in districts else -1 for h in home])
@@ -613,10 +640,12 @@ def remix(base: dict, null_factor: float = 3.0, core_purity: float = 0.85,
 
     second = np.full(len(M), "", dtype=object)
     second_w = np.zeros(len(M))
+    second_ph = np.zeros(len(M))
     for i in range(len(M)):
         for j in np.argsort(-M[i]):
             if j != hidx[i] and M[i, j] > 0:
                 second[i], second_w[i] = districts[j], M[i, j]
+                second_ph[i] = phase[i, j]
                 break
 
     mix = pd.DataFrame(M, index=G.index, columns=[f"w_{d}" for d in districts])
@@ -632,6 +661,12 @@ def remix(base: dict, null_factor: float = 3.0, core_purity: float = 0.85,
     mix["second"] = second
     mix["w_second"] = second_w
     mix["neg_mass"] = -neg.sum(axis=1)
+    mix["anti_phase_share"] = anti_share
+    mix["second_phase"] = second_ph
+    mix["home_phase"] = np.array([phase[i, hidx[i]] if hidx[i] >= 0 else 0.0
+                                  for i in range(len(M))])
+    for j, d in enumerate(districts):
+        mix[f"phase_{d}"] = phase[:, j]
     mix["degenerate_null"] = base["degenerate"].reindex(G.index).to_numpy()
     mix["snr_home"] = np.array([
         DZ.to_numpy()[i, hidx[i]] / max(NULL.to_numpy()[i], EPS) if hidx[i] >= 0
@@ -641,7 +676,7 @@ def remix(base: dict, null_factor: float = 3.0, core_purity: float = 0.85,
     out = dict(base)
     out.update({"mixture": mix, "null_factor": null_factor,
                 "core_purity": core_purity, "foreign_max": foreign_max,
-                "gate": gate})
+                "gate": gate, "mixture_rule": mixture})
     return out
 
 

@@ -565,8 +565,9 @@ def validate_placement(eff: dict) -> None:
     except (TypeError, ValueError):
         raise ValueError("sensor_placement.probe.seed must be an int, got "
                          f"{(sp.get('probe') or {}).get('seed')!r}.") from None
-    from fedwater.placement.store import gate
+    from fedwater.placement.store import gate, mixture_rule
     gate(sp.get("classes") or {})
+    mixture_rule(sp.get("classes") or {})
     ref = (sp.get("selection_coupling") or {}).get("variant")
     if ref not in ("baseline", "isolated"):
         raise ValueError("sensor_placement.selection_coupling.variant must be "

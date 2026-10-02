@@ -279,7 +279,7 @@ studies:
         network: ky72
         sim_seed: 43                 # must differ from probe.seed (42)
         n_months: auto               # auto_horizon: 12 pre, 12 post, 3 spare
-        days_per_month: 30
+        days_per_month: 21
         seasonality_scale: 0.0       # off for world AND probes
         drift_ramp_days: 7
         anchor_scale: 0.50
@@ -300,7 +300,7 @@ studies:
           n_surrogates_expensive: 8
           minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
       grid:
-        districting: [spectral, girvan_newman]
+        districting: [spectral, girvan_newman, fast_greedy] #fast_greedy
     runs:
       fixed: {rounds: 8}
     pipelines: []

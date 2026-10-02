@@ -247,15 +247,15 @@ land_use:
   # the `mixed` and `commercial` mixes) put median beta_max_pass at 0.5 and
   # failed on single-district drifts. These values raise it to 1.0 for
   # single-district drifts. KEEP THEM unless re-running the ablation.
-  intensity_rel: {commercial: 2.5, industrial: 8}
+  intensity_rel: {commercial: 2.5, industrial: 6}
 
   # Plot shares per land-use class. Plot COUNT is conserved across a land-use
   # change, so the level factor is the ratio of mean plot intensities.
   mix:
     residential: {residential: 1.00}
     mixed:       {residential: 0.70, commercial: 0.30}
-    commercial:  {residential: 0.35, commercial: 0.65}
-    industrial:  {residential: 0.20, commercial: 0.30, industrial: 0.50}
+    commercial:  {residential: 0.15, commercial: 0.85}
+    industrial:  {residential: 0.0, commercial: 0.25, industrial: 0.75}
 
   reference: [low, residential]  # (income, land_use) whose level_factor == 1
   min_plots: 0.5                 # cohorts below half a plot are DROPPED and the
@@ -411,17 +411,26 @@ sensor_placement:
                              # `null_factors` (1.0 disables the gate)
     null_factor: 1.5         # a response counts when |proj| > factor x noise
     null_factors: [1.0, 1.5, 3.0]
-    # gate: norm             # which noise test admits a (gauge, district)
+    gate: projection         # which noise test admits a (gauge, district)
                              # cell into the mixture:
-                             #   norm       ||dz|| > null_factor x split-half
-                             #              norm floor (default; the rule
-                             #              every existing stack was built on)
                              #   projection |proj| > null_factor x the noise
                              #              projected on the same direction
                              #              (the rule elasticity/dependence use)
-                             # Left commented: absent == norm, and only a
-                             # non-norm gate enters world and stack identity,
-                             # so no existing hash moves.
+                             #   norm       ||dz|| > null_factor x split-half
+                             #              norm floor (every stack built
+                             #              before the key existed)
+    mixture: magnitude       # what a live cell contributes to the simplex:
+                             #   magnitude  |g| -- which districts move the
+                             #              gauge, whatever the direction; the
+                             #              direction is kept in phase_<D>,
+                             #              home_phase, second_phase and
+                             #              anti_phase_share
+                             #   positive   g+ only (every stack built before
+                             #              the key existed): an anti-phase
+                             #              own-district gauge reads as
+                             #              "foreign" from its positive crumbs
+                             # Either key absent == the old rule, and only a
+                             # non-old value enters the stack identity.
   dedupe_min_distance: 0.10  # two gauges closer than this read the same thing
 
   # Sensors are SELECTED on a stack at this coupling (baseline | isolated), so
@@ -437,7 +446,7 @@ sensor_placement:
     transitions:
       residential: industrial
       mixed: industrial
-      commercial: industrial
+      commercial: residential
       industrial: residential
 
     # ---- which time grid the probes run on --------------------------------
@@ -464,7 +473,7 @@ sensor_placement:
     growth_chance: 1.0       # diffusion: planned
 
     # planned grid (horizon: planned only)
-    days_per_month: 14
+    days_per_month: 21
     warmup_months: 8
     drift_ramp_days: 7
     n_months: auto           # auto = what horizon_plan says the partition needs
