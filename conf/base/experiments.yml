@@ -307,7 +307,45 @@ studies:
     harvest: [validation]
 
 
-
+  dtown_districting_all_districts:
+    description: >
+      KY7 on two generated partitions: every district drifts in turn to its
+      probe transition, as independent worlds (sim_seed 43 vs probe seed 42),
+      30-day months, auto front and auto horizon -- one n_months and ONE probe
+      stack per partition. Worlds only; FL not run.
+      Expands to 8 worlds; auto horizon resolves to 66 months (spectral) and
+      70 months (girvan_newman); engine pre-flight passes.
+    worlds:
+      fixed:
+        network: dtown
+        sim_seed: 43                 # must differ from probe.seed (42)
+        n_months: auto               # auto_horizon: 12 pre, 12 post, 3 spare
+        days_per_month: 21
+        seasonality_scale: 0.0       # off for world AND probes
+        drift_ramp_days: 7
+        anchor_scale: 0.25
+        beta: 0.35
+        consumption_map: LC_LR_LR_LC_LI
+        coupling: {variant: baseline, close_fraction: 0.0}
+        drift_all_districts: true    # K worlds per partition; no drift target
+        drift: {max_neighbors_per_month: auto, convert_months: 12}
+        placement:
+          source: dynamic
+          slots:
+            flow:     {pure: 2, mixed: 2}
+            pressure: {pure: 2, mixed: 2}
+          probe: {horizon: world, seasonality: world, diffusion: planned}
+        oracle:
+          tiers: [1, 4]
+          n_surrogates: 20
+          n_surrogates_expensive: 8
+          minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
+      grid:
+        districting: [fast_greedy] #fast_greedy
+    runs:
+      fixed: {rounds: 8}
+    pipelines: []
+    harvest: [validation]
 
 
 

@@ -175,6 +175,8 @@ notebooks/fedwater_lab_refactor/lab_sandbox/aer_study/
 notebooks/fedwater_lab_refactor/poc05_grid/
 notebooks/fedwater_lab_refactor/poc05c_similarity/
 
+notebooks/outputs/
+
 # EPANET scratch files written to the working directory during runs
 temp.inp
 temp.bin
