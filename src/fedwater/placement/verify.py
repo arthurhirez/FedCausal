@@ -4,8 +4,9 @@ Selection never reads the target world. This runs afterwards, on the world's
 own series, and asks one question per sensor: when the world's drift district
 changed, how much of that change reached the gauge? It is the POC's
 ``world_response`` estimator applied to the real world -- one column of the
-gain matrix -- next to the label the probe stack predicted for that column
-(``w_<drift district>``).
+gain matrix -- next to the exact labels the probe stack's exact layer gives
+for that drift (``S_<drift district>``, the shape effect, and
+``dm_<drift district>``, the mixture change).
 
 It is a REPORT, never a gate: a world whose drift has not settled inside its
 horizon gets ``status = unsettled`` rows and the pipeline continues.
@@ -34,9 +35,9 @@ def verify_placement(placement: pd.DataFrame, pressures: pd.DataFrame,
         return out
     tgt = str(schedule.sort_values("drift_month")["district"].iloc[0])
     out.insert(0, "drift_district", tgt)
-    label = f"w_{tgt}"
-    out["expected_w_drift"] = (placement[label].to_numpy()
-                               if label in placement.columns else np.nan)
+    for lab, col in (("S", "expected_S_drift"), ("dm", "expected_dm_drift")):
+        out[col] = (placement[f"{lab}_{tgt}"].to_numpy()
+                    if f"{lab}_{tgt}" in placement.columns else np.nan)
 
     P = sp.Probe(districts=districts["districts"],
                  assets=districts.get("assets") or {}, demand=demand,
@@ -93,10 +94,12 @@ def verify_placement(placement: pd.DataFrame, pressures: pd.DataFrame,
     out["clears_noise"] = (r["proj"].abs() > r["nu"]).to_numpy()
     out["settled_from_month"] = r["settle_start_month"].to_numpy()
 
-    # agreement between prediction and observation, across the chosen set
-    ok = out[["expected_w_drift", "observed_g"]].dropna()
+    # agreement between prediction and observation, across the chosen set:
+    # the exact shape effect S (>= 0) against the size of the observed shape gain
+    ok = pd.DataFrame({"S": out["expected_S_drift"],
+                       "g": out["observed_g"].abs()}).dropna()
     rho = (float(ok.rank().corr().iloc[0, 1]) if len(ok) > 2
-           and ok["expected_w_drift"].nunique() > 1 else np.nan)
+           and ok["S"].nunique() > 1 else np.nan)
     out["spearman_expected_vs_observed"] = rho
     out["status"] = "ok"
     return out

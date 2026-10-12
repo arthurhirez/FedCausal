@@ -125,9 +125,33 @@ def test_world_identity_tracks_partition_and_placement_rule(ctx):
     assert with_base(lambda p: p["districting"].update(seed=99)) \
         == w0["sim_hash"]
     assert with_base(lambda p: p["sensor_placement"]["slots"]["flow"].update(
-        mixed=1)) != w0["sim_hash"]
+        transit=1)) != w0["sim_hash"]
+    assert with_base(lambda p: p["sensor_placement"]["selection"].update(
+        d_min=0.2)) != w0["sim_hash"]              # the rule is world identity
     assert with_base(lambda p: p["sensor_placement"]["probe"][
         "transitions"].update(industrial="commercial")) != w0["sim_hash"]
+    # only the ACTIVE rule's blocks are identity; `rule: exact` is the default
+    assert with_base(lambda p: p["sensor_placement"]["legacy"].update(
+        min_n_mass=3)) == w0["sim_hash"]
+    assert with_base(lambda p: p["sensor_placement"].pop("rule")) \
+        == w0["sim_hash"]
+
+    def legacy(p, **kw):
+        p["sensor_placement"].update(rule="legacy")
+        p["sensor_placement"]["slots"] = {"flow": {"pure": 3, "mixed": 2},
+                                          "pressure": {"pure": 3, "mixed": 2}}
+        p["sensor_placement"]["legacy"].update(kw)
+    h_leg = with_base(legacy)
+    assert h_leg != w0["sim_hash"]
+    assert with_base(lambda p: (legacy(p), p["sensor_placement"][
+        "selection"].update(d_min=0.3))) == h_leg       # exact blocks inactive
+    assert with_base(lambda p: legacy(p, min_n_mass=3)) != h_leg
+    # a study switches rule through `placement`; its slots replace the base's
+    w_leg = world({"placement": {"rule": "legacy",
+                                 "slots": {"flow": {"pure": 3, "mixed": 2}}}})
+    assert w_leg["override"]["sensor_placement"]["slots"] == {
+        "flow": {"pure": 3, "mixed": 2}}
+    spec_mod.validate_world(w_leg, ctx["districts"])
 
     profile2 = copy.deepcopy(b["profile"])
     profile2["sensors"]["District_A"]["flow"] = ["P-1"]
@@ -157,11 +181,30 @@ def test_validator_checks_the_placement_block(ctx):
             (lambda p: p["sensor_placement"]["selection_coupling"].update(
                 variant="partial"), "selection_coupling"),
             (lambda p: p["sensor_placement"]["slots"].update(
-                acoustic={"pure": 1, "mixed": 0}), "slots")):
+                acoustic={"branch": 1, "transit": 0}), "slots"),
+            (lambda p: p["sensor_placement"]["slots"].update(
+                flow={"pure": 2, "mixed": 2}), "do not belong to rule"),
+            (lambda p: p["sensor_placement"].update(rule="legacy"),
+             "do not belong to rule"),                 # branch slots, legacy rule
+            (lambda p: p["sensor_placement"].update(rule="greedy"), "rule"),
+            (lambda p: p["sensor_placement"]["slots"].update(
+                pressure={"branch": 1, "transit": 0}), "pressure"),
+            (lambda p: p["sensor_placement"]["probe"].update(
+                retain_series=False), "retain_series"),
+            (lambda p: p["sensor_placement"]["selection"].update(
+                dist="euclid"), "dist")):
         base = copy.deepcopy(BASE)
         mutate(base)
         with pytest.raises(ValueError, match=match):
             spec_mod.validate_world(ctx["world"](base=base), ctx["districts"])
+    # the legacy rule takes pure / mixed slots, pressure included
+    base = copy.deepcopy(BASE)
+    base["sensor_placement"].update(rule="legacy")
+    base["sensor_placement"]["slots"] = {"flow": {"pure": 3, "mixed": 2},
+                                         "pressure": {"pure": 3, "mixed": 2}}
+    w = ctx["world"](base=base)
+    spec_mod.validate_world(w, ctx["districts"])
+    assert w["flat"]["slots_flow"] == 5 and w["flat"]["slots_pressure"] == 5
 
 
 def test_resolve_run_promotes_keys_and_hashes_fl_identity():
@@ -399,7 +442,7 @@ def _stub_kedro(behaviour):
 def _sim_artifacts(cwd: Path):
     _fake_run_data(cwd)         # reuse the same known-answer tree
     pd.DataFrame({"district": ["District_A"], "kind": ["flow"],
-                  "slot": ["q_pure_0"], "sensor": ["q_P-1"],
+                  "slot": ["q_branch_0"], "sensor": ["q_P-1"],
                   "element": ["P-1"]}).to_csv(
         cwd / "data/03_primary/sensor_placement.csv", index=False)
     (cwd / "data/07_model_output/clients").mkdir(parents=True, exist_ok=True)

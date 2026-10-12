@@ -169,8 +169,8 @@ studies:
         placement:
           source: dynamic             # dynamic | manual (profile `sensors:`)
           slots:                      # identical for every district
-            flow:     {pure: 2, mixed: 2}
-            pressure: {pure: 2, mixed: 2}        
+            flow:     {branch: 2, transit: 2}
+            pressure: {branch: 0, transit: 0}
           probe: {horizon: world, seasonality: world, diffusion: planned}
         oracle:
           tiers: [1, 4]
@@ -250,8 +250,8 @@ studies:
         placement:
           source: dynamic             # dynamic | manual (profile `sensors:`)
           slots:                      # identical for every district
-            flow:     {pure: 2, mixed: 2}
-            pressure: {pure: 2, mixed: 2}        
+            flow:     {branch: 2, transit: 2}
+            pressure: {branch: 0, transit: 0}
           probe: {horizon: world, seasonality: world, diffusion: planned}
         oracle:
           tiers: [1, 4]
@@ -291,8 +291,8 @@ studies:
         placement:
           source: dynamic
           slots:
-            flow:     {pure: 2, mixed: 2}
-            pressure: {pure: 2, mixed: 2}
+            flow:     {branch: 2, transit: 2}
+            pressure: {branch: 0, transit: 0}
           probe: {horizon: world, seasonality: world, diffusion: planned}
         oracle:
           tiers: [1, 4]
@@ -307,14 +307,14 @@ studies:
     harvest: [validation]
 
 
-  dtown_districting_all_districts:
+  dtown_districting_placement:
     description: >
-      KY7 on two generated partitions: every district drifts in turn to its
+      D-Town on generated partitions: every district drifts in turn to its
       probe transition, as independent worlds (sim_seed 43 vs probe seed 42),
-      30-day months, auto front and auto horizon -- one n_months and ONE probe
+      21-day months, auto front and auto horizon -- one n_months and ONE probe
       stack per partition. Worlds only; FL not run.
-      Expands to 8 worlds; auto horizon resolves to 66 months (spectral) and
-      70 months (girvan_newman); engine pre-flight passes.
+      Five worlds per partition; the probe stacks of fast_greedy and
+      girvan_newman resolved to 71 months.
     worlds:
       fixed:
         network: dtown
@@ -332,8 +332,8 @@ studies:
         placement:
           source: dynamic
           slots:
-            flow:     {pure: 2, mixed: 2}
-            pressure: {pure: 2, mixed: 2}
+            flow:     {branch: 2, transit: 2}
+            pressure: {branch: 0, transit: 0}
           probe: {horizon: world, seasonality: world, diffusion: planned}
         oracle:
           tiers: [1, 4]

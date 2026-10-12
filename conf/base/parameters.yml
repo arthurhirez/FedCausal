@@ -395,20 +395,76 @@ districting:
 sensor_placement:
   source: dynamic          # dynamic | manual
   store: ${globals:probe_store}
+  rule: exact              # exact  | legacy -- which rule fills the slots:
+                           #   exact   fedwater.placement.select, on the
+                           #           stack's exact layer (branch / transit)
+                           #   legacy  fedwater.placement.select_legacy, the
+                           #           pre-exact pure / mixed ladder on the
+                           #           stack's own estimator (reproduces
+                           #           worlds placed before Oct 2026; set
+                           #           slots to pure / mixed, e.g.
+                           #           flow: {pure: 3, mixed: 2})
+                           # Only the active rule's blocks are world identity.
 
   # Identical for every district -> identical client feature geometry.
-  # Columns are named by slot: q_pure_0..2, q_mixed_0..1, p_pure_0..2, ...
+  # Columns are named by slot: q_branch_0..1, q_transit_0..1. The rule is in
+  # fedwater.placement.select (module docstring); every quantity it reads is
+  # the stack's exact layer (fedwater.placement.exact). The class names must
+  # be the rule's own (exact: branch / transit; legacy: pure / mixed).
+  #   branch   a bridge with a source on one side only: carries exactly the
+  #            demand downstream of it
+  #   transit  a loop / source_bridge whose water mix changes when a foreign
+  #            district drifts (or, failing that, that carries foreign water)
+  # Pressure must be 0: no rule exists yet -- pressure needs its own NODE
+  # topology (tree subtree vs looped core) before branch / transit mean
+  # anything for a junction.
   slots:
-    flow:     {pure: 3, mixed: 2}
-    pressure: {pure: 3, mixed: 2}
+    flow:     {branch: 2, transit: 2}
+    pressure: {branch: 0, transit: 0}
 
-  classes:
-    core_purity: 0.85        # pure: home share >= this
-    foreign_max: 0.15        # tier `foreign` below this home share
+  # The flow rule (defaults set by notebooks/exact_selection_sweep.ipynb on
+  # the D-Town and KY7 stacks, Oct 2026).
+  selection:
+    flow_floor: 0.05         # candidates carry mean |q| >= this x network median
+    j_max: 0.2               # branches: max Jaccard overlap of downstream nodes
+    dm_min: 0.005            # transit pool: |dm_k| >= this for a foreign k
+                             # (share of the link's district water)
+    new_partner: true        # pool: prefer a pick credited to a new district
+    d_min: 0.1               # transits at least this far apart (signature)
+    dist: js                 # signature distance: js | cosine
+    m_carry: 0.05            # mixed tier: largest foreign share >= this
+    rho: 1.5                 # mixed tier attribution: top response >= rho x 2nd
+    attr: S                  # mixed tier attribution metric: S | Nr
+
+  # Channel taxonomy of a (link, drifting district) cell -- an ATTRIBUTE of
+  # every chosen sensor (cls_<k> in sensor_placement.csv), never a gate.
+  taxonomy:
+    S_floor: 0.25            # the cell responds (shape effect, sd)
+    Nr_floor: 0.05           # ... or native gain relative to the home district
+    ch_lo: 0.333             # E2 storage share below: demand channel
+    ch_hi: 0.667             # above: storage (hub) channel
+    m_carry: 0.05            # k's share of the link's water (drift world):
+    m_trace: 0.01            #   carrier >= m_carry, trace in [m_trace, m_carry)
+
+  # The exact layer (cached per stack physics under <stack>/exact/<hash>/).
+  exact:
+    e2: true                 # storage share via mediator-blocked twins (K + 1 runs)
+    save_series: true        # keep the no-drift city's flows (dose notebook)
+    sigma_floor: 1.0e-3      # sigma undefined where |g_de0| + |g_ie0| is below
+                             # this (gain units, L/s per L/s; as own_min for Nr).
+                             # Applied on load: changing it never recomputes.
+
+  # rule: legacy only -- the old ladder's thresholds (read by
+  # fedwater.placement.select_legacy, values as shipped before Oct 2026).
+  legacy:
     mixed_min_foreign: 0.25  # mixed: largest single foreign share >= this
     min_n_mass: 2            # mixed: at least this many districts carry mass
     max_purity_swing: 0.20   # mixed: purity may move at most this much across
-                             # `null_factors` (1.0 disables the gate)
+                             # `classes.null_factors` (1.0 disables the gate)
+
+  classes:                   # the probe stack's own analysis (stack identity)
+    core_purity: 0.85        # tier `core`: home share >= this
+    foreign_max: 0.15        # tier `foreign` below this home share
     null_factor: 1.5         # a response counts when |proj| > factor x noise
     null_factors: [1.0, 1.5, 3.0]
     gate: projection         # which noise test admits a (gauge, district)
@@ -431,11 +487,13 @@ sensor_placement:
                              #              "foreign" from its positive crumbs
                              # Either key absent == the old rule, and only a
                              # non-old value enters the stack identity.
-  dedupe_min_distance: 0.10  # two gauges closer than this read the same thing
+  dedupe_min_distance: 0.10  # report-only arms (and rule: legacy): gauges
+                             # closer than this read the same thing
 
   # Sensors are SELECTED on a stack at this coupling (baseline | isolated), so
   # every coupling arm of a study gets the same sensors. Their LABELS
-  # (w_<District> in sensor_placement.csv) come from a stack at the world's
+  # (S_/Nr_/dm_/sigma_/cls_<District> in sensor_placement.csv, from the exact
+  # layer) come from a stack at the world's
   # REALISED coupling -- its actual closed pipes -- so a `partial` draw that
   # closed nothing shares the baseline stack.
   selection_coupling: {variant: baseline}
@@ -592,8 +650,11 @@ fl:                         # ---- federated learning over the client CSVs ----
     feature_range: [-1.0, 1.0]
     # Which packaged sensor columns become features. RUN identity: a world
     # always packages every slot, so changing these never re-simulates.
-    channels: [flow, pressure]   # subset of {flow, pressure}
-    classes: all                 # all | [pure] | [mixed] | [pure, mixed]
+    channels: [flow]             # subset of {flow, pressure} (pressure slots
+                                 # are 0 while no pressure rule exists)
+    classes: all                 # all | a subset of the placement rule's slot
+                                 # classes: [branch] / [transit] (rule exact),
+                                 # [pure] / [mixed] (rule legacy)
                                  # (slot-named columns only)
   model:
     lstm_units: 30          # latent dim = 2 x units (bi-LSTM bottleneck)

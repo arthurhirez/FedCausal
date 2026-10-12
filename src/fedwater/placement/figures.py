@@ -339,21 +339,30 @@ def channel_bars(ax, channels: pd.DataFrame, min_tv: float = 0.25):
     return ax
 
 
-FILL_COLOUR = {"pure": "#2e8b57", "mixed": "#1f78b4",
-               "pure_redundant": "#8fd19e", "mixed_redundant": "#9ecae1",
-               "pure_fill": "#e08214", "best_available": "#c0392b",
-               "unresponsive": "#7f7f7f"}
+FILL_COLOUR = {"branch": "#2e8b57", "pool": "#1f78b4", "mixed": "#e08214",
+               "branch_fill": "#8fd19e", "short": "#c0392b"}
+LEGACY_FILL_COLOUR = {"pure": "#2e8b57", "mixed": "#1f78b4",
+                      "pure_redundant": "#8fd19e", "mixed_redundant": "#9ecae1",
+                      "pure_fill": "#e08214", "best_available": "#c0392b",
+                      "unresponsive": "#7f7f7f"}
 
 
 def slot_fill_bars(ax, coverage: pd.DataFrame, kind: str = "flow"):
-    """How each district's slots were filled, one stacked bar per
-    (district, slot class). All green/blue is a placement by the book; orange
-    and red are the fill ladder working; grey is a slot no probe reached."""
+    """How each district's slots were filled (``placement_coverage``), one
+    stacked bar per district: branches, transits from the pool (mixture
+    change), from the mixed tier (carries foreign water), further branches in
+    transit slots, and slots left short. A ``rule: legacy`` coverage (one row
+    per district and slot class) is drawn with the old ladder's fills."""
     d = coverage[coverage["kind"] == kind].reset_index(drop=True)
-    labels = [f"{_short(r.district)}/{r.slot_class}" for r in d.itertuples()]
+    legacy = "slot_class" in d.columns
+    if legacy:
+        labels = [f"{_short(r.district)}/{r.slot_class}" for r in d.itertuples()]
+    else:
+        d = d.assign(n_short=d.get("short_branch", 0) + d.get("short_transit", 0))
+        labels = [_short(r.district) for r in d.itertuples()]
     x = np.arange(len(d))
     bottom = np.zeros(len(d))
-    for fill, colour in FILL_COLOUR.items():
+    for fill, colour in (LEGACY_FILL_COLOUR if legacy else FILL_COLOUR).items():
         col = f"n_{fill}"
         if col not in d.columns:
             continue

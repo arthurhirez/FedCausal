@@ -14,9 +14,17 @@ Modules
 ``signal_probe``    candidates, weekly profiles, the resemblance battery
 ``mixture_probe``   gains, mixture, tiers, elasticity, dependence, response,
                     settling, estimator checks
+``exact``           exact, threshold-free quantities of a stack (paired against
+                    the spliced no-drift city): labels, E1 composition and its
+                    change under drift, E2 storage share, topology, gates;
+                    cached per physics under ``<stack>/exact/<hash>/``
+``epanet_loop``     EPANET toolkit step loop (mediator/tank state, run
+                    integrity) and the mediator-blocked twin (M1)
 ``classification``  blend shape, channel diversity, report-only arms
-``select``          the shipped slot composite and its fill ladder
-``verify``          the chosen set against the world's own drift
+``select``          the flow rule on the exact layer (``rule: exact``): branch +
+                    transit slots, candidates, labels written per drifting district
+``select_legacy``   the pre-exact pure / mixed ladder (``rule: legacy``), kept to
+                    reproduce earlier worlds and compare
 ``readouts``        cross-world battery read-outs (leak, carriers, stability)
 ``topology``        .inp geometry for the network figures
 ``figures``         static figures (matplotlib)

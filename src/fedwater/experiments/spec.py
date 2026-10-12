@@ -329,6 +329,11 @@ def resolve_world(world: dict, base_params: dict, network: str,
     if world.get("placement"):
         override["sensor_placement"] = _deep_merge(
             base["sensor_placement"], world["placement"])
+        if "slots" in world["placement"]:
+            # a study's slots REPLACE the base's: merged, a legacy study's
+            # pure / mixed would sit beside the base's branch / transit
+            override["sensor_placement"]["slots"] = copy.deepcopy(
+                world["placement"]["slots"])
     for key, patch in (world.get("sim_overrides") or {}).items():
         if key == "fl":
             raise ValueError("sim_overrides cannot touch 'fl' (run-level).")
@@ -372,6 +377,18 @@ def resolve_world(world: dict, base_params: dict, network: str,
     # old hand placement must not be served under a new one.
     placement = copy.deepcopy(effective.get("sensor_placement") or {})
     placement.pop("store", None)
+    # Only the ACTIVE rule's blocks are identity: tuning the legacy thresholds
+    # must not rehash exact-rule worlds, nor the exact blocks legacy worlds.
+    # `rule: exact` is the default and is dropped, so worlds written before
+    # the key existed keep their hashes.
+    if placement.get("source", "dynamic") != "manual":
+        from fedwater.placement.select import rule_of
+        if rule_of(placement) == "legacy":
+            for k in ("selection", "taxonomy", "exact"):
+                placement.pop(k, None)
+        else:
+            placement.pop("legacy", None)
+            placement.pop("rule", None)
     effective["sensor_placement"] = placement
     source = placement.get("source", "dynamic")
     manual_sensors = (copy.deepcopy((profile or {}).get("sensors") or {})
@@ -379,7 +396,7 @@ def resolve_world(world: dict, base_params: dict, network: str,
     if source == "manual":
         effective["manual_sensors"] = manual_sensors
     slots = placement.get("slots") or {}
-    per_district = {k: int(v.get("pure", 0)) + int(v.get("mixed", 0))
+    per_district = {k: sum(int(n) for n in (v or {}).values())
                     for k, v in slots.items()}
     flat = {
         "network": network,
@@ -540,11 +557,40 @@ def validate_placement(eff: dict) -> None:
     if not slots or set(slots) - {"flow", "pressure"}:
         raise ValueError(f"sensor_placement.slots must be keyed by flow / "
                          f"pressure, got {sorted(slots)}.")
+    from fedwater.placement.select import RULES, _cfg, rule_of
+    rule = rule_of(sp)
+    allowed = set(RULES[rule])
     for kind, v in slots.items():
-        if min(int(v.get("pure", 0)), int(v.get("mixed", 0))) < 0 \
-                or int(v.get("pure", 0)) + int(v.get("mixed", 0)) == 0:
-            raise ValueError(f"sensor_placement.slots.{kind} needs a "
-                             f"non-negative, non-zero pure + mixed, got {v}.")
+        v = v or {}
+        other = sorted(set(v) - allowed)
+        if other:
+            raise ValueError(
+                f"sensor_placement.slots.{kind}: class(es) {other} do not "
+                f"belong to rule {rule!r}, whose classes are "
+                f"{sorted(allowed)} (rule exact: branch / transit; rule "
+                "legacy: pure / mixed).")
+        if min((int(n) for n in v.values()), default=0) < 0:
+            raise ValueError(f"sensor_placement.slots.{kind} needs non-negative "
+                             f"counts, got {v}.")
+    count = {k: sum(int(n) for n in (v or {}).values())
+             for k, v in slots.items()}
+    if rule == "exact":
+        if count.get("pressure", 0) > 0:
+            raise ValueError(
+                "sensor_placement.slots.pressure must be 0 under rule exact: "
+                "branch / transit are link classes, and pressure needs its "
+                "own node topology (tree subtree vs looped core) before a "
+                "placement rule exists.")
+        if count.get("flow", 0) == 0:
+            raise ValueError("sensor_placement.slots.flow needs at least one "
+                             "slot.")
+        if not (sp.get("probe") or {}).get("retain_series", True):
+            raise ValueError("sensor_placement.probe.retain_series must be "
+                             "true: the exact layer the sensors are chosen on "
+                             "reads the probe worlds' series.")
+        _cfg(sp.get("selection"), sp.get("taxonomy"))
+    elif sum(count.values()) == 0:
+        raise ValueError("sensor_placement.slots: no slot at all.")
     from fedwater.placement.excite import probe_modes
     from fedwater.placement.mixture_probe import SEASON_MONTHS
     modes = probe_modes(sp.get("probe") or {})
@@ -687,7 +733,8 @@ def all_district_worlds(world: dict, base_params: dict, network: str,
 
     District ``k`` drifts to ``probe.transitions[its initial land use]`` with
     its income kept -- exactly the excitation its probe world applies, so
-    ``verify`` compares like with like. The world's own front, grid and seed
+    the out-of-sample check (``notebooks/placement_generalisation.ipynb``)
+    compares like with like. The world's own front, grid and seed
     are untouched. Refused: an explicit drift target (it would be silently
     overwritten), and ``sim_seed == probe.seed`` for dynamic sensors (the
     worlds would reproduce the probe worlds the sensors were chosen on).

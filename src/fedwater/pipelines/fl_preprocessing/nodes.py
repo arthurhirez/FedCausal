@@ -73,18 +73,21 @@ def _windows_and_labels(agg: np.ndarray, agg_months: np.ndarray,
 
 
 _CHANNEL_PREFIX = {"pressure": "p_", "flow": "q_"}
-_SLOT_CLASSES = ("pure", "mixed")
+# every rule's slot classes (placement.select.RULES): exact branch / transit,
+# legacy pure / mixed
+_SLOT_CLASSES = ("branch", "transit", "pure", "mixed")
 
 
 def select_feature_columns(columns, cfg: dict, client: str = "") -> list[str]:
     """Which sensor columns become model features, in a fixed order.
 
     ``fl.preprocessing.channels`` (pressure / flow) and ``.classes``
-    (``all`` or a subset of pure / mixed) are RUN-level choices: a world
+    (``all`` or a subset of the placement rule's classes: branch / transit,
+    or pure / mixed under ``rule: legacy``) are RUN-level choices: a world
     always packages every slot, so switching what the model sees is a cheap
     run on a cached world, never a re-simulation.
 
-    Class filtering needs slot-named columns (``q_pure_0``). A manual
+    Class filtering needs slot-named columns (``q_branch_0``). A manual
     placement keeps element names (``q_P-13``) and carries no class, so it
     accepts only ``classes: all``.
     """

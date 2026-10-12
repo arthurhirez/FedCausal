@@ -222,11 +222,6 @@ placement_report_arms:      # control_low / unusable -- report only
   filepath: data/08_reporting/sensor_placement/report_arms.csv
   save_args: {index: false}
 
-placement_verification:
-  type: pandas.CSVDataset
-  filepath: data/08_reporting/sensor_placement/verification.csv
-  save_args: {index: false}
-
 # --- sensing: what federated clients observe ------------------------------
 sensor_series:
   type: pandas.ParquetDataset

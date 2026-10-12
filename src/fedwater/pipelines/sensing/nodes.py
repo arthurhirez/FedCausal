@@ -25,7 +25,7 @@ def extract_sensor_series(pressures: pd.DataFrame, flows: pd.DataFrame,
 
     ``sensor`` is the ELEMENT id (``q_P-13``) and keys the measurement-noise
     RNG, so an element's noise realisation does not depend on which slot it
-    was chosen for. ``slot`` (``q_pure_0``) is the client-CSV column: slots are
+    was chosen for. ``slot`` (``q_branch_0``) is the client-CSV column: slots are
     identical across districts, which is what gives every federated client the
     same feature geometry. For a manual placement ``slot == sensor``, so the
     client CSVs keep their historical column names.
@@ -79,7 +79,7 @@ def package_client_datasets(sensor_series: pd.DataFrame, time: dict,
     is carried alongside, so downstream labeling never re-derives months from
     calendar arithmetic.
 
-    Columns are slot names (``p_mixed_0 ... q_pure_2``), identical for every
+    Columns are slot names (``q_branch_0 ... q_transit_1``), identical for every
     district, so ``preprocess_clients``' sorted column order means the same
     thing in every client. The element behind each slot is recorded in
     ``sensor_placement.csv``.
