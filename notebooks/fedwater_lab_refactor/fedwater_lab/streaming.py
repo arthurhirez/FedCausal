@@ -36,6 +36,31 @@ regime change visible as a pull AWAY from them.
 Rounds are numbered cumulatively across blocks, so `training_log`,
 `prototype_history` and the snapshots keep the schema every other module
 expects; a `block` column is added next to it.
+
+Block-end snapshots (trajectory views)
+-------------------------------------
+The trainer only ever holds one block's windows, so its own snapshots could
+never show the whole horizon under one encoder. Instead, once before block 0
+(round -1, the untrained init) and after every block (round = that block's
+last cumulative round), the run encodes windows of ALL months on detached
+COPIES of the weights -- training is never touched, so a run with these
+snapshots trains bit-identically to one without:
+
+* `latents_by_round`: one month-stratified sample of every client's windows
+  over the whole horizon (the SAME windows at every snapshot round, so a
+  window's path across rounds is readable). `stage="post"` = global weights;
+  `stage="pre"` = the client's local weights after its last local update of
+  the block (pre-FedAvg). Round -1 has `pre` only, as before. Extra columns:
+  `block` and `seen` (month <= the block's last month: in-sample by then).
+* `prototypes`: a `block_full` scope -- per-client per-month mean over ALL
+  windows, global weights -- at round -1 and at every block end, so a round
+  selector reads "the whole-horizon trajectory as the model stood after
+  block b". Its own scope, NOT more `post_fedavg_full` rows: `aligned.check`,
+  `selfcheck` and `sweep` merge `post_fedavg_full` on (client, month) and
+  rely on it holding exactly one round (the final model). The last block's
+  `block_full` rows therefore equal `post_fedavg_full`.
+* `meta.blocks` records gain `r_lo` / `r_hi` (cumulative round span), which
+  is how a reader maps a snapshot round back to its block.
 """
 from __future__ import annotations
 
@@ -127,6 +152,95 @@ def filter_windows(fl_windows: dict, lo: int, hi: int) -> dict:
     return out
 
 
+def stratified_index(fl_windows: dict, points: int, seed: int) -> dict:
+    """Per-client window indices over ALL months, quota-balanced by month.
+
+    The same rule as `SnapshotFPLTrainer._stratified_index`, applied to the
+    full `fl_windows` rather than the trainer's slice."""
+    rng = np.random.default_rng(seed)
+    clients = sorted(fl_windows)
+    per_client = max(1, points // max(1, len(clients)))
+    out = {}
+    for c in clients:
+        labels = np.asarray(fl_windows[c]["labels"])
+        months = np.unique(labels)
+        quota = max(1, per_client // max(1, len(months)))
+        picked, deficit = [], 0
+        for m in months:
+            idx = np.flatnonzero(labels == m)
+            take = min(len(idx), quota + deficit)
+            deficit = max(0, quota + deficit - len(idx))
+            picked.append(rng.choice(idx, take, replace=False))
+        sel = np.sort(np.concatenate(picked)) if picked else np.array([], int)
+        out[c] = sel.astype(int)
+    return out
+
+
+def _weights_copy(model, state: dict | None = None):
+    """A detached copy of `model` (same device), optionally loaded with
+    `state`. Encoding through the copy leaves the trainer's model, its mode
+    and its RNG untouched."""    
+    m = copy.deepcopy(model)
+    if state is not None:
+        m.load_state_dict(state)
+    from . import train as T
+    T.flatten_rnn_weights(m)
+    m.eval()
+    return m
+
+
+def _encode_sample(model, fl_windows: dict, idx: dict, clients,
+                   batch: int = 512) -> pd.DataFrame:
+    """`idx`-selected windows of `clients` through `model.encode`, in the
+    trainer's snapshot schema (district, kind, round, stage, window, month,
+    f0..) minus round/stage, which the caller adds."""
+    sub = {c: {"windows": np.asarray(fl_windows[c]["windows"])[idx[c]],
+               "labels": np.asarray(fl_windows[c]["labels"])[idx[c]],
+               "window_start_step":
+                   np.asarray(fl_windows[c]["window_start_step"])[idx[c]]}
+           for c in clients if len(idx.get(c, ()))}
+    return encode_windows(model, sub, batch=batch) if sub else pd.DataFrame()
+
+
+def _block_end_snapshot(global_model, local_states: dict, fl_windows: dict,
+                        idx: dict, round_idx: int, block: int,
+                        m_hi: int | None) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """(snapshot rows, `block_full` prototype rows) for one snapshot round.
+
+    `local_states` empty -> only the `pre` stage from the global weights
+    (round -1, where every client model IS the global init)."""
+    clients = sorted(fl_windows)
+    g = _weights_copy(global_model)
+    parts = []
+    if local_states:
+        parts.append(_encode_sample(g, fl_windows, idx, clients)
+                     .assign(stage="post"))
+        for c in clients:
+            lm = _weights_copy(global_model, local_states.get(c))
+            parts.append(_encode_sample(lm, fl_windows, idx, [c])
+                         .assign(stage="pre"))
+            del lm
+    else:
+        parts.append(_encode_sample(g, fl_windows, idx, clients)
+                     .assign(stage="pre"))
+    snap = pd.concat([p for p in parts if len(p)], ignore_index=True)
+    fc = [c for c in snap.columns if c.startswith("f") and c[1:].isdigit()]
+    snap["round"] = int(round_idx)
+    snap["block"] = int(block)
+    snap["seen"] = (snap["month"] <= m_hi) if m_hi is not None else False
+    snap = snap[["district", "kind", "round", "stage", "window", "month"]
+                + fc + ["block", "seen"]]
+
+    lt = encode_windows(g, fl_windows)
+    full = (lt.groupby(["district", "month"])[fc].mean().reset_index()
+            .rename(columns={"district": "client"})
+            .assign(scope="block_full", round=int(round_idx),
+                    cluster=np.nan))
+    full = full[["scope", "round", "client", "month", "cluster"] + fc]
+    del g
+    return snap, full
+
+
 def _scores(model, X, reg_ratio: float) -> dict:
     from .localeval import _aer, _med_amp_r, reconstruct
     D = reconstruct(model, X)
@@ -150,8 +264,11 @@ def run_stream(world: World, spec: CellSpec, fl_windows: dict, fl: dict,
 
     g_state, l_state, g_protos = None, {}, {}
     ph, gph, logs, preq, snaps, lat_preq = [], [], [], [], [], []
-    gram = []
+    gram, block_full, spans = [], [], {}
     cum, t0 = 0, time.time()
+    # one window sample over the WHOLE horizon, reused at every snapshot
+    # round, so each sampled window has a path across rounds
+    snap_idx = stratified_index(fl_windows, int(spec.snapshot_points), seed)
 
     for bi, (lo, hi) in enumerate(blocks):
         fw_b = filter_windows(fl_windows, lo, hi)
@@ -162,8 +279,10 @@ def run_stream(world: World, spec: CellSpec, fl_windows: dict, fl: dict,
         fl_b = copy.deepcopy(fl)
         fl_b["training"]["rounds"] = rounds
 
+        # snapshots are taken here, on copies, over every month -- the
+        # trainer's own (one block's windows only) are switched off
         tr = T.SnapshotFPLTrainer(fw_b, fl_b, seed + bi, rounds=rounds,
-                                  snapshot_rounds=(-1,) if bi == 0 else (),
+                                  snapshot_rounds=(),
                                   points=spec.snapshot_points, verbose=False,
                                   loss_terms=spec.loss_terms)
         if g_state is not None:                       # carry the model over
@@ -172,6 +291,12 @@ def run_stream(world: World, spec: CellSpec, fl_windows: dict, fl: dict,
                 tr.models[c].load_state_dict(l_state.get(c, g_state))
             tr.global_protos = copy.deepcopy(g_protos)
         T.flatten_rnn_weights(tr.global_model, *tr.models.values())
+
+        if g_state is None:                # round -1: the shared untrained init
+            sn, bf = _block_end_snapshot(tr.global_model, {}, fl_windows,
+                                         snap_idx, -1, -1, None)
+            snaps.append(sn)
+            block_full.append(bf)
 
         # ---- 1. score the unseen block, with the model as it stands now
         for c in tr.clients:
@@ -195,11 +320,18 @@ def run_stream(world: World, spec: CellSpec, fl_windows: dict, fl: dict,
                                                   cum + int(r["round"]))})
         for r in tr.gram_rows:
             gram.append({**r, "block": bi, "round": cum + int(r["round"])})
-        sn = tr.snapshots()
-        if sn is not None and len(sn):
-            sn = sn.copy()
-            sn["round"] = [cum + int(r) if r >= 0 else -1 for r in sn["round"]]
-            snaps.append(sn.assign(block=bi))
+
+        # ---- 3. block-end snapshot: global + each client's local weights,
+        #         every month, on copies (training above is untouched)
+        r_end = cum + rounds - 1
+        # a client offline for the whole block (participation < 1) keeps
+        # the local weights it carried in
+        sn, bf = _block_end_snapshot(tr.global_model,
+                                     {**l_state, **tr.local_states},
+                                     fl_windows, snap_idx, r_end, bi, hi)
+        snaps.append(sn)
+        block_full.append(bf)
+        spans[bi] = (cum, r_end)
 
         g_state = {k: v.detach().cpu().clone()
                    for k, v in tr.global_model.state_dict().items()}
@@ -220,6 +352,18 @@ def run_stream(world: World, spec: CellSpec, fl_windows: dict, fl: dict,
     lat_preq = pd.concat(lat_preq, ignore_index=True)
     ph, gph = pd.DataFrame(ph), pd.DataFrame(gph)
     snaps = pd.concat(snaps, ignore_index=True) if snaps else None
+    prototypes = pd.concat([T.compile_prototypes(ph, gph, snaps, lt),
+                            *block_full], ignore_index=True)
+    blocks_df = (pd.DataFrame(blocks, columns=["m_lo", "m_hi"])
+                 .rename_axis("block").reset_index())
+    blocks_df["r_lo"] = [spans.get(b, (np.nan, np.nan))[0]
+                         for b in blocks_df["block"]]
+    blocks_df["r_hi"] = [spans.get(b, (np.nan, np.nan))[1]
+                         for b in blocks_df["block"]]
+    # `train.run_cell` records `tr.snap_rounds` as meta.snapshot_rounds; the
+    # last trainer had none of its own, so report the rounds taken here
+    tr.snap_rounds = set(int(r) for r in snaps["round"].unique()) \
+        if snaps is not None else set()
     return {"prototype_history": ph, "global_prototype_history": gph,
             "latent_trajectories": T._tag(lt, world),
             "latent_trajectories_preq": T._tag(lat_preq, world),
@@ -227,10 +371,9 @@ def run_stream(world: World, spec: CellSpec, fl_windows: dict, fl: dict,
             "training_log": pd.DataFrame(logs),
             "snapshots": None if snaps is None else T._tag(snaps, world),
             "update_gram": pd.DataFrame(gram),
-            "prototypes": T.compile_prototypes(ph, gph, snaps, lt),
+            "prototypes": prototypes,
             "drift_signals": bridge.compute_drift_signals(ph, fl),
             "models": {"global": g_state, **l_state},
-            "blocks": pd.DataFrame(blocks, columns=["m_lo", "m_hi"])
-                        .rename_axis("block").reset_index(),
+            "blocks": blocks_df,
             "trainer": tr, "seconds": round(time.time() - t0, 1),
             "rounds_total": cum}

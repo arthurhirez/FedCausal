@@ -42,9 +42,11 @@ def _round_slice(protos, scope, round_idx):
 
 
 def _in_phase(month, bounds):
-    """Months inside a phase band; bounds read as inclusive [lo, hi]."""
+    """Months inside a phase band. `world.phases()` bounds are HALF-OPEN
+    [lo, hi) -- the same reading as `world.phase_months` / `phase_of`; an
+    inclusive `hi` would put the first transition month into `init`."""
     lo, hi = bounds
-    return (month >= lo) & (month <= hi)
+    return (month >= lo) & (month < hi)
 
 
 def _phase_centroids(d, F, world, by_client):
@@ -63,9 +65,10 @@ def _phase_centroids(d, F, world, by_client):
 
 
 def _shade_phases(ax, world):
-    ph = world.phases()
-    ax.axvspan(*ph["init"], color=_INIT_C, alpha=.10, lw=0)
-    ax.axvspan(*ph["final"], color=_FINAL_C, alpha=.10, lw=0)
+    ph = world.phases()                    # half-open [lo, hi): months lo..hi-1
+    for name, col in (("init", _INIT_C), ("final", _FINAL_C)):
+        lo, hi = ph[name]
+        ax.axvspan(lo - .5, hi - .5, color=col, alpha=.10, lw=0)
 
 
 def _client_centroid(mu, c, phase):
@@ -236,7 +239,7 @@ def plot_prototype_heatmaps(axes, protos, world, scope="local", round_idx=None,
                        extent=[months[0] - .5, months[-1] + .5, len(order) - .5, -.5])
         for name, col in (("init", _INIT_C), ("final", _FINAL_C)):
             lo, hi = ph[name]
-            for x in (lo - .5, hi + .5):
+            for x in (lo - .5, hi - .5):       # half-open: last month is hi-1
                 ax.axvline(x, color=col, lw=1.0, ls="--")
         ax.set_title(str(c), fontsize=8)
         ax.set_xlabel("month")
