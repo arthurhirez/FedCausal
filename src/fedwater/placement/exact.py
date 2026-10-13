@@ -21,13 +21,26 @@ windows, so they are comparable to the stack's gains):
                     undefined (NaN) where |g_de0| + |g_ie0| < ``sigma_floor``: a ratio of two near-zero
                     gains is not a channel split (it flipped 0.006 -> 0.63 between seeds on D-Town)
 * topology          branch / source_bridge / loop / isolated, downstream sets of branches
+* E2 on the drift trajectories (``e2_traj``): probe world k re-simulated through the toolkit loop
+                    (gate: = the stored world), and the twins B(D0, traj_k), B(D_k, traj_k); g_de1 (demand
+                    channel with the hub held on k's own course), the interaction |g_de1 - g_de0| on the
+                    sigma scale (large: the split depends on which course the hub is held on), and S_de0
+                    (shape effect with the hub held on the no-drift course)
+* periods / months  (``periods``) g_w, S, Nr per link x k on the init (baseline), transition and final
+                    (settled) windows -- ``labels_period.parquet`` -- and month by month, with each pump's
+                    on-fraction -- ``labels_monthly.parquet``
+* card series       (``cards``) per k, ``cards/<k>.npz``: weekly profiles on k's settled window and two
+                    hourly sample weeks (its first and last) of every link in every run (no-drift city,
+                    drift world, the four twins), the district demands, and the E1 hour-of-week
+                    composition of the no-drift city and the drift world on that window
 
-and the gates that make the numbers trustworthy (G-X0 .. G-X6, ``gates.csv``).
+and the gates that make the numbers trustworthy (G-X0 .. G-X6d, ``gates.csv``).
 
 Nothing here is a selection rule: no thresholds beyond numerical guards. Selection reads these
 tables (``links.parquet``, ``labels.parquet``) and applies its own.
 
-Cost: 1 + (K + 1 if e2) EPANET runs of the stack's horizon, plus E1 (~1-3 ms per network-hour).
+Cost: 1 + (K + 1 if e2) + (3K if e2_traj) EPANET runs of the stack's horizon, plus E1 (~1-3 ms per
+network-hour).
 Cache: ``<physics owner>/exact/<hash>/`` where the owner is the stack that holds the probe worlds
 (``probes_from`` donor or the stack itself) and the hash covers the physics spec, this module's
 config and ``EXACT_VERSION``. An analysis-only change of the stack (gate, mixture rule, thresholds)
@@ -56,21 +69,26 @@ from . import mixture_probe as mp
 from . import signal_probe as sp
 from .store import _read_json, _write_json, physics
 
-__all__ = ["EXACT_VERSION", "DEFAULTS", "link_topology", "splice_nodrift", "E1Net",
-           "sigma_share", "ensure_exact", "load_exact", "exact_dir"]
+__all__ = ["EXACT_VERSION", "DEFAULTS", "CARD_RUNS", "link_topology", "splice_nodrift", "E1Net",
+           "sigma_share", "ensure_exact", "load_exact", "load_card", "exact_dir"]
 
-EXACT_VERSION = 1
+EXACT_VERSION = 2
 DEFAULTS = {
     "e2": True,                 # storage share via blocked twins (K + 1 extra runs)
+    "e2_traj": True,            # E2 on each drift trajectory: re-simulated drift world + 2 twins (3K runs)
+    "periods": True,            # labels on init / transition / final windows and month by month
+    "cards": True,              # per-k card series (profiles, two sample weeks, E1 hour of week)
     "eps": 1e-9,                # L/s: a link below this carries no flow in E1
     "own_min": 1e-3,            # |g_w| on the home district below this: Nr undefined
     "sigma_floor": 1e-3,        # |g_de0| + |g_ie0| below this: sigma undefined (gain units, as own_min)
     "dead_frac": 1e-3,          # mean |q| below this x the median: a dead link
     "save_series": True,        # keep the no-drift city's flows (float32) for the dose notebook
     "gates": {"pre_drift": 1e-6, "branch_gain": 1e-3, "e1_row": 1e-9, "e1_close": 1e-6,
-              "e1_branch": 1e-6, "twin": 1e-3, "branch_ie0": 1e-3},
+              "e1_branch": 1e-6, "twin": 1e-3, "branch_ie0": 1e-3, "resim": 1e-6},
 }
 GROUPS_TAIL = ("storage", "reservoir", "unaccounted")
+# card runs: no-drift city, drift world, twins B(demand, trajectory)
+CARD_RUNS = ("nodrift", "drift", "twin_0_traj0", "twin_k_traj0", "twin_0_trajk", "twin_k_trajk")
 _UNHASHED = ("save_series", "sigma_floor")      # applied on load / output only: never recompute for them
 
 
@@ -242,11 +260,12 @@ class E1Net:
         dev = float(np.max(np.abs(rs - 1.0))) if len(rs) else 0.0
         return np.where(act)[0], q[:, None] * Phi[v], q, dev
 
-    def run(self, F: np.ndarray, D: np.ndarray, hours, sd: int, how_window=None):
+    def run(self, F: np.ndarray, D: np.ndarray, hours, sd: int, how_window=None, how_windows=None):
         """Accumulate over ``hours`` (absolute indices into F / D rows).
 
         Returns dict: day (n_days x L x G float32, keyed by absolute day in ``days``), days, how
-        (L x 7sd x G hour-of-week totals over ``how_window`` hours, or None), row_dev, close_dev."""
+        (L x 7sd x G hour-of-week totals over ``how_window`` hours, or None), hows (the same per entry
+        of ``how_windows``, a dict name -> (lo, hi)), row_dev, close_dev."""
         hours = np.asarray(sorted(hours))
         days = np.unique(hours // sd)
         dpos = {dd: i for i, dd in enumerate(days)}
@@ -257,6 +276,8 @@ class E1Net:
         P = 7 * sd
         how = np.zeros((L, P, self.G)) if how_window is not None else None
         hw = how_window or (0, 0)
+        hws = dict(how_windows or {})
+        hows = {n: np.zeros((L, P, self.G), np.float32) for n in hws}
         row_dev, close_dev = 0.0, 0.0
         for t in hours:
             dd = t // sd
@@ -271,9 +292,12 @@ class E1Net:
             acc[li] += c
             if how is not None and hw[0] <= t < hw[1]:
                 how[li, t % P] += c
+            for n, (a, b) in hws.items():
+                if a <= t < b:
+                    hows[n][li, t % P] += c
         if cur is not None:
             day[dpos[cur]] = acc
-        return {"day": day, "days": days, "how": how, "row_dev": row_dev, "close_dev": close_dev}
+        return {"day": day, "days": days, "how": how, "hows": hows, "row_dev": row_dev, "close_dev": close_dev}
 
 
 def _window(day: np.ndarray, days: np.ndarray, lo: int, hi: int, sd: int) -> np.ndarray:
@@ -341,6 +365,22 @@ def paired_effect(Q1, Q0, dD, sd: int, lo: int, orient) -> dict:
     nD = float(np.sqrt(dD @ dD))
     return {"g_w": _gain_w(dQ, dD, sd, lo) * orient, "S": S,
             "amp": np.sqrt((dQ ** 2).sum(axis=0)) / max(nD, 1e-12), "mean_abs_dq": mdq}
+
+
+def _pre_zero(Qk, R0, a: int, b: int, t_div: int) -> np.ndarray:
+    """Probe world k's flows on [a, b), set to the no-drift city's before k's demand departs from it: the response
+    there is exactly zero by construction (G-X2 bounds the stored flows' difference at <= 1e-6 relative; left in,
+    that rounding would read as a tiny, undefined response in the pre-drift months)."""
+    Q = np.asarray(Qk[a:b], float).copy()
+    n = max(0, min(b, t_div) - a)
+    Q[:n] = R0[a:a + n]
+    return Q
+
+
+def _pump_on(Q: np.ndarray) -> np.ndarray:
+    """A pump is on when |q| exceeds 1e-6 of its largest |q| in the series (as dependence_compute)."""
+    Q = np.abs(np.asarray(Q, float))
+    return Q > 1e-6 * np.maximum(Q.max(axis=0), 1e-12)
 
 
 def _orient(Q: np.ndarray) -> np.ndarray:
@@ -417,10 +457,17 @@ def load_exact(path, cfg: dict | None = None) -> dict:
         out[name] = pd.read_parquet(path / f"{name}.parquet")
     for name in ("gates", "runs", "splice"):
         out[name] = pd.read_csv(path / f"{name}.csv")
+    for name in ("labels_period", "labels_monthly"):
+        f = path / f"{name}.parquet"
+        out[name] = pd.read_parquet(f) if f.exists() else None
     floor = float({**DEFAULTS, **(cfg or {})}["sigma_floor"])
     L = out["labels"]
     if {"g_de0", "g_ie0"} <= set(L.columns):
         L["sigma"] = sigma_share(L["g_de0"], L["g_ie0"], floor)
+        if "g_de1" in L.columns:                  # |g_de1 - g_de0| on the sigma scale; undefined where sigma is
+            den = L["g_de0"].abs() + L["g_ie0"].abs()
+            ok = den >= max(floor, 1e-12)
+            L["interaction"] = np.where(ok, (L["g_de1"] - L["g_de0"]).abs() / np.where(ok, den, 1.0), np.nan)
     out["manifest"] = {**mf, "sigma_floor": floor}
     return out
 
@@ -428,6 +475,12 @@ def load_exact(path, cfg: dict | None = None) -> dict:
 # ==========================================================================
 # the layer
 # ==========================================================================
+def load_card(path, k: str) -> dict:
+    """Card series of drifting district k (``cards/<k>.npz``), as a dict of arrays."""
+    with np.load(Path(path) / "cards" / f"{k}.npz", allow_pickle=False) as z:
+        return {n: z[n] for n in z.files}
+
+
 def ensure_exact(stack_path, cfg: dict | None = None, force: bool = False, verbose: bool = True) -> dict:
     """Load the exact layer of a probe stack, or compute and cache it. See the module docstring."""
     stack_path = Path(stack_path)
@@ -462,6 +515,9 @@ def ensure_exact(stack_path, cfg: dict | None = None, force: bool = False, verbo
         manifest.update(res["manifest"])
         for name in ("links", "labels", "downstream"):
             res[name].to_parquet(out_dir / f"{name}.parquet", index=False)
+        for name in ("labels_period", "labels_monthly"):
+            if len(res[name]):
+                res[name].to_parquet(out_dir / f"{name}.parquet", index=False)
         for name in ("gates", "runs", "splice"):
             res[name].to_csv(out_dir / f"{name}.csv", index=False)
         manifest.update({"status": "ok", "error": "", "seconds": round(_time.time() - t_start, 1),
@@ -537,7 +593,9 @@ def _compute(src, doc, districts, names, K, settle, season_aligned, cfg, gth, ou
     hrs = set(range(*W0))
     for d in names:
         hrs |= set(range(*win[d][1]))
-    E0 = e1.run(R0.astype(float), Dv0, hrs, sd, how_window=W0)
+    cards = bool(cfg.get("cards", True))
+    E0 = e1.run(R0.astype(float), Dv0, hrs, sd, how_window=W0,
+                how_windows={d: win[d][1] for d in names} if cards else None)
     say(f"  E1 no-drift: {len(hrs)} h ({_time.time() - t0:.0f} s)")
     e1_gate = [{"world": "no-drift", "row_dev": E0["row_dev"], "close_dev": E0["close_dev"]}]
 
@@ -608,6 +666,8 @@ def _compute(src, doc, districts, names, K, settle, season_aligned, cfg, gth, ou
 
     # -- E2: the twin on the no-drift trajectory --------------------------------------------------
     e2 = bool(cfg["e2"])
+    e2_traj = e2 and bool(cfg.get("e2_traj", True))
+    periods = bool(cfg.get("periods", True))
     gaps = 0
     if e2:
         wb, dem, info = el.blocked_model(wn0, D0, r0, H)
@@ -622,8 +682,11 @@ def _compute(src, doc, districts, names, K, settle, season_aligned, cfg, gth, ou
         twin_abs = np.nan
 
     # -- pass 2: per drifting district -----------------------------------------------------------
-    LAB, pre_rows, br_rows, ie_rows = [], [], [], []
+    LAB, pre_rows, br_rows, ie_rows, PER, MON = [], [], [], [], [], []
     down_sign = LT["down_sign"].to_numpy(float)
+    pump_ix = [lix[p] for p in links if p in pumps]
+    if cards:
+        (out_dir / "cards").mkdir(exist_ok=True)
     for k in names:
         P = _world(src, k, doc)
         (b_lo, b_hi), (f0, f1) = win[k]
@@ -653,7 +716,8 @@ def _compute(src, doc, districts, names, K, settle, season_aligned, cfg, gth, ou
                                 "g_exact": float(exp_ @ dD / nd), "g_sim": float(got @ dD / nd)})
 
         # E1 on probe k's settled window, paired with the no-drift city's
-        Ek = e1.run(Qk, Dk[e1.jcols].to_numpy(float), range(f0, f1), sd)
+        Ek = e1.run(Qk, Dk[e1.jcols].to_numpy(float), range(f0, f1), sd,
+                    how_window=(f0, f1) if cards else None)
         e1_gate.append({"world": k, "row_dev": Ek["row_dev"], "close_dev": Ek["close_dev"]})
         C1 = _window(Ek["day"], Ek["days"], f0, f1, sd)
         C0f = _window(E0["day"], E0["days"], f0, f1, sd)
@@ -691,11 +755,87 @@ def _compute(src, doc, districts, names, K, settle, season_aligned, cfg, gth, ou
             # the twin's own error, in the units it is used in: its gain on k's drift (the hour-0 solve
             # and a handful of near-zero-flow hours differ by ~1e-3 L/s; that is not a response)
             g_err = _gain_w(B0[f0:f1].astype(float) - Q0w, dD, sd, f0)
-            ie_rows.append({"k": k, "twin_max_abs_g_err": float(np.nanmax(np.abs(g_err))), "branch_max_abs_g_ie0": float(np.abs(g_ie0[[lix[l] for l in br]]).max())
-                            if br else 0.0})
-            del Bk
+            ie = {"k": k, "twin_max_abs_g_err": float(np.nanmax(np.abs(g_err))),
+                  "branch_max_abs_g_ie0": float(np.abs(g_ie0[[lix[l] for l in br]]).max()) if br else 0.0}
+            # shape effect with the hub held on the no-drift course: demand transit alone, as a client sees it
+            lab["S_de0"] = paired_effect(Bk[f0:f1].astype(float), B0[f0:f1].astype(float), dD, sd, f0, orient)["S"]
+            Bk0k = Bkk = None
+            if e2_traj:
+                # probe world k through the toolkit loop (its trajectory: tank heads, mediator states) and the twins
+                # held on it: B(D0, traj_k), B(D_k, traj_k)
+                rk = log(el.simulate(wn0, Dk, H, pmin_nodes=jcols, dtype=np.float32), f"drift({k}) re-simulated")
+                ixr = [rk["links"].index(l) for l in links]
+                ie["resim_max_rel"] = float(np.nanmax(_rel_dev(rk["snap"][:, ixr], Qk)))
+                wb, dem, _ = el.blocked_model(wn0, D0, rk, H)
+                Bk0k = log(el.simulate(wb, dem, H, pmin_nodes=jcols, dtype=np.float32),
+                           f"twin(0, traj {k})")["snap"][:, ixb]
+                wb, dem, info1 = el.blocked_model(wn0, Dk, rk, H)
+                Bkk = log(el.simulate(wb, dem, H, pmin_nodes=jcols, dtype=np.float32),
+                          f"twin({k}, traj {k})")["snap"][:, ixb]
+                del rk, wb, dem
+                g_de1 = _gain_w(Bkk[f0:f1].astype(float) - Bk0k[f0:f1].astype(float), dD, sd, f0) * orient
+                g_twin = _gain_w(Bkk[f0:f1].astype(float) - B0[f0:f1].astype(float), dD, sd, f0) * orient
+                lab["g_de1"], lab["g_ie1"] = g_de1, g_tot - g_de1
+                ie["twin_traj_max_abs_g_err"] = float(np.nanmax(np.abs(g_twin - g_tot)))
+                ie["twin_traj_max_abs_dq"] = float(np.abs(Bkk[f0:f1].astype(float) - Qk[f0:f1]).max())
+                ie["traj_gaps"] = int(info1["ill_posed_hours"])
+            ie_rows.append(ie)
+        else:
+            Bk = Bk0k = Bkk = None
+
+        # labels on the init / transition / final windows, and month by month
+        if periods:
+            dK_all = Dkk - Dk0[k]
+            spans = {"init": (b_lo, b_hi), "transition": (b_hi, f0), "final": (f0, f1)}
+            for per, (a, b) in spans.items():
+                if b - a < 7 * sd:
+                    continue
+                e_ = paired_effect(_pre_zero(Qk, R0, a, b, t_div), R0[a:b].astype(float), dK_all[a:b], sd, a, orient)
+                g_ = np.where(e_["mean_abs_dq"] == 0, 0.0, e_["g_w"])          # nothing changed: exactly zero
+                PER.append(pd.DataFrame({"element": links, "k": k, "period": per, "window_lo": a, "window_hi": b,
+                                         "g_w": g_, "S": e_["S"], "mean_abs_dq": e_["mean_abs_dq"],
+                                         "dD_mean": float(dK_all[a:b].mean())}))
+            on0 = _pump_on(R0[:, pump_ix]) if pump_ix else None
+            onk = _pump_on(Qk[:, pump_ix]) if pump_ix else None
+            for mo in range(H // sm):
+                a, b = mo * sm, (mo + 1) * sm
+                e_ = paired_effect(_pre_zero(Qk, R0, a, b, t_div), R0[a:b].astype(float), dK_all[a:b], sd, a, orient)
+                g_ = np.where(e_["mean_abs_dq"] == 0, 0.0, e_["g_w"])
+                fr = pd.DataFrame({"element": links, "k": k, "month": mo, "g_w": g_, "S": e_["S"],
+                                   "mean_abs_dq": e_["mean_abs_dq"], "dD_mean": float(dK_all[a:b].mean()),
+                                   "dD_abs_mean": float(np.abs(dK_all[a:b]).mean())})
+                if pump_ix:
+                    fr["on_nodrift"], fr["on_drift"] = np.nan, np.nan
+                    fr.loc[pump_ix, "on_nodrift"] = on0[a:b].mean(axis=0)
+                    fr.loc[pump_ix, "on_drift"] = onk[a:b].mean(axis=0)
+                MON.append(fr)
+
+        # card series: weekly profiles on k's settled window and its first / last week, every link, every run
+        if cards:
+            P_ = 7 * sd
+            wk = [f0, max(f0, f1 - P_)]
+            runs_ = {"nodrift": R0, "drift": Qk, "twin_0_traj0": B0 if e2 else None, "twin_k_traj0": Bk,
+                     "twin_0_trajk": Bk0k, "twin_k_trajk": Bkk}
+            arr = {"links": np.array(links), "districts": np.array(names), "window": np.array([f0, f1]),
+                   "weeks": np.array(wk), "steps_day": np.array(sd),
+                   "dests": np.array(names + list(GROUPS_TAIL))}
+            for nm, X in runs_.items():
+                if X is None:
+                    continue
+                arr[f"prof__{nm}"] = _profile(X[f0:f1], sd, f0).astype(np.float32)          # L x 7sd
+                arr[f"week__{nm}"] = np.stack([np.asarray(X[w:w + P_], np.float32) for w in wk])   # 2 x 7sd x L
+            Dall0 = np.column_stack([Dk0[d] for d in names])
+            Dallk = Dall0.copy()
+            Dallk[:, j] = Dkk
+            arr["prof__demand_nodrift"] = _profile(Dall0[f0:f1], sd, f0).astype(np.float32)   # K x 7sd
+            arr["prof__demand_drift"] = _profile(Dallk[f0:f1], sd, f0).astype(np.float32)
+            arr["week__demand_nodrift"] = np.stack([Dall0[w:w + P_].astype(np.float32) for w in wk])
+            arr["week__demand_drift"] = np.stack([Dallk[w:w + P_].astype(np.float32) for w in wk])
+            arr["how__nodrift"] = E0["hows"][k].astype(np.float32)                            # L x 7sd x G
+            arr["how__drift"] = Ek["how"].astype(np.float32)
+            np.savez_compressed(out_dir / "cards" / f"{k}.npz", **arr)
         LAB.append(lab)
-        del P, Qk, Ek
+        del P, Qk, Ek, Bk, Bk0k, Bkk
         say(f"  {k}: settled {f0 // sm}-{f1 // sm} mo, drift from h {t_div} ({_time.time() - t0:.0f} s)")
 
     LABELS = pd.concat(LAB, ignore_index=True)
@@ -711,6 +851,18 @@ def _compute(src, doc, districts, names, K, settle, season_aligned, cfg, gth, ou
         LABELS = LABELS.merge(BR[["k", "element", "carries"]], on=["k", "element"], how="left")
     else:
         LABELS["carries"] = np.nan
+
+    def _with_nr(T, key):
+        if not len(T):
+            return T
+        T["own"] = T["k"] == T["element"].map(homes)
+        own_g = T[T["own"]].set_index(["element"] + key)["g_w"]
+        gh = pd.Series(list(zip(T["element"], *[T[c] for c in key]))).map(own_g.to_dict()).to_numpy(float)
+        T["Nr"] = np.where(np.abs(gh) >= om, np.abs(T["g_w"]) / np.where(np.abs(gh) >= om, np.abs(gh), 1.0), np.nan)
+        T.loc[T["g_w"] == 0, "Nr"] = 0.0
+        return T
+    PERT = _with_nr(pd.concat(PER, ignore_index=True), ["period"]) if PER else pd.DataFrame()
+    MONT = _with_nr(pd.concat(MON, ignore_index=True), ["month"]) if MON else pd.DataFrame()
 
     DOWNT = pd.DataFrame([{"element": l, "node": n} for l, ns in DOWN.items() for n in sorted(ns)])
 
@@ -745,13 +897,24 @@ def _compute(src, doc, districts, names, K, settle, season_aligned, cfg, gth, ou
               _g("G-X6b", "every twin hour has a head reference", str(gaps), gaps == 0),
               _g("G-X6c", "no storage share on branches (|g_ie0|)", f"{IE['branch_max_abs_g_ie0'].max():.1e}",
                  IE["branch_max_abs_g_ie0"].max() <= gth["branch_ie0"])]
+        if e2_traj:
+            G += [_g("G-X0c", "drift worlds re-simulated through the toolkit loop = the stored probe worlds (max rel)",
+                     f"{IE['resim_max_rel'].max():.1e}", IE["resim_max_rel"].max() <= gth["resim"]),
+                  _g("G-X6d", "twin(k, traj k) - twin(0, traj0) reproduces the drift's response (gain units; "
+                     "max |dq| vs the drift world in L/s)",
+                     f"{IE['twin_traj_max_abs_g_err'].max():.1e} ({IE['twin_traj_max_abs_dq'].max():.1e} L/s)",
+                     IE["twin_traj_max_abs_g_err"].max() <= gth["twin"]),
+                  _g("G-X6e", "every hour of every drift trajectory has a head reference",
+                     str(int(IE["traj_gaps"].max())), int(IE["traj_gaps"].max()) == 0)]
     GATES = pd.DataFrame(G)
     windows = {k: {"baseline": list(map(int, win[k][0])), "settled": list(map(int, win[k][1]))} for k in names}
     return {"links": LINKS, "labels": LABELS, "downstream": DOWNT, "gates": GATES, "runs": RUNS,
+            "labels_period": PERT, "labels_monthly": MONT,
             "splice": splice.merge(PRE.rename(columns={"k": "district"}), on="district", how="left"),
             "manifest": {"hours": H, "steps_day": sd, "steps_month": sm, "nodrift_window": list(map(int, W0)),
                          "season_aligned": season_aligned, "windows": windows, "e2": e2,
-                         "series": ["nodrift_flows.parquet"] if cfg.get("save_series", True) else []}}
+                         "series": ["nodrift_flows.parquet"] if cfg.get("save_series", True) else [],
+                         "e2_traj": e2_traj, "periods": periods, "cards": cards}}
 
 
 def _g(gid, what, value, passed) -> dict:

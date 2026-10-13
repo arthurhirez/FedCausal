@@ -453,6 +453,11 @@ sensor_placement:
     sigma_floor: 1.0e-3      # sigma undefined where |g_de0| + |g_ie0| is below
                              # this (gain units, L/s per L/s; as own_min for Nr).
                              # Applied on load: changing it never recomputes.
+    # Not set here (exact.DEFAULTS, all on; they change no sensor and no
+    # placement column, so they stay out of the world identity): e2_traj (E2
+    # on each drift trajectory, 3K runs), periods (init / transition / final
+    # and monthly labels), cards (per-k card series). gt_compute.ipynb needs all
+    # three; the pipeline computes them once per stack (the cache is shared).
 
   # rule: legacy only -- the old ladder's thresholds (read by
   # fedwater.placement.select_legacy, values as shipped before Oct 2026).

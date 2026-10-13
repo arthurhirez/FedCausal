@@ -171,3 +171,34 @@ def test_sigma_is_undefined_below_the_gain_floor_and_the_floor_never_recomputes(
     assert Xb["labels"].loc[den < big, "sigma"].isna().all()
     assert Xb["manifest"]["sigma_floor"] == big
     np.testing.assert_allclose(Xb["labels"].loc[den >= big, "sigma"], B.loc[den >= big, "sigma"])
+
+
+def test_trajectory_twins_periods_months_and_cards(tmp_path):
+    path = fake_stack(tmp_path)
+    X = ex.ensure_exact(path, verbose=False)
+    G = X["gates"].set_index("gate")
+    for g in ("G-X0c", "G-X6d", "G-X6e"):                                  # E2 on the drift trajectories
+        assert g in G.index and bool(G.at[g, "passed"]), G
+    B = X["labels"]
+    assert {"g_de1", "g_ie1", "interaction", "S_de0"} <= set(B.columns)
+    br = B[B["element"] == "P5"].set_index("k")                            # a branch: demand transit only
+    assert br.at["District_B", "S_de0"] == pytest.approx(br.at["District_B", "S"], abs=1e-6)
+    assert br.at["District_B", "interaction"] == pytest.approx(0.0, abs=1e-3)
+    LP = X["labels_period"]
+    fin = LP[LP["period"] == "final"].merge(B[["element", "k", "g_w", "S"]], on=["element", "k"], suffixes=("", "_lab"))
+    np.testing.assert_allclose(fin["S"], fin["S_lab"], atol=1e-12)          # final period = the labels' window
+    np.testing.assert_allclose(fin["g_w"].fillna(0), fin["g_w_lab"].fillna(0), atol=1e-12)
+    init = LP[LP["period"] == "init"]
+    assert len(init) and (init["g_w"] == 0).all() and (init["S"] == 0).all()   # before the drift: exactly zero
+    M = X["labels_monthly"]
+    n_months = X["manifest"]["hours"] // X["manifest"]["steps_month"]
+    assert len(M) == n_months * len(X["links"]) * len(DISTRICTS)
+    assert M.loc[M["element"] == "PU", "on_drift"].notna().all()           # pump on-fraction per month
+    C = ex.load_card(X["path"], "District_B")
+    L, P_ = len(C["links"]), 7 * int(C["steps_day"])
+    for run in ex.CARD_RUNS:
+        assert C[f"prof__{run}"].shape == (L, P_) and C[f"week__{run}"].shape == (2, P_, L)
+    assert C["how__drift"].shape == (L, P_, len(C["dests"]))
+    i5 = list(C["links"]).index("P5")
+    d_how = C["how__drift"][i5].sum(axis=0)                                  # P5's water ends in District_B only
+    assert d_how[list(C["dests"]).index("District_B")] / d_how.sum() == pytest.approx(1.0)

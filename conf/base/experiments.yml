@@ -266,7 +266,7 @@ studies:
     harvest: [validation]
 
 
-  ky72_districting_all_districts:
+  ky72_districting_placement:
     description: >
       KY7 on two generated partitions: every district drifts in turn to its
       probe transition, as independent worlds (sim_seed 43 vs probe seed 42),
@@ -341,7 +341,7 @@ studies:
           n_surrogates_expensive: 8
           minirocket: {window_h: 24, stride_h: 6, n_kernels: 1000, pca_dims: 8}
       grid:
-        districting: [fast_greedy] #fast_greedy
+        districting: [fast_greedy, girvan_newman] #fast_greedy
     runs:
       fixed: {rounds: 8}
     pipelines: []

@@ -26,7 +26,7 @@ __all__ = ["CLASSES", "TRANSFORMS", "SCALINGS", "KINDS", "Geometry",
 # Which SLOTS a spec draws from (`sensor_placement.csv`'s `slot_class`).
 # `manual` is not a class to filter on -- it is the world's own placement
 # source (see `World.placement_source`), not something a spec chooses.
-CLASSES = ("pure", "mixed")
+CLASSES = ("branch", "transit")
 
 TRANSFORMS = ("none", "slog", "diff", "deseason_own", "deseason_shared")
 
